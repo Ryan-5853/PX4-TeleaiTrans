@@ -7,6 +7,7 @@
 #pragma once
 
 #include "GsLinkProtocol.hpp"
+#include "GsLinkDiagnostics.hpp"
 
 #include <drivers/drv_hrt.h>
 #include <px4_platform_common/Serial.hpp>
@@ -24,6 +25,23 @@
 #include <uORB/topics/gs_link_status.h>
 #include <uORB/topics/rc_channels.h>
 #include <uORB/topics/vehicle_attitude.h>
+#include <uORB/topics/vehicle_odometry.h>
+
+#include <uORB/topics/airlink_status.h>
+#include <uORB/topics/airlink_health.h>
+#include <uORB/topics/airlink_actuator_command.h>
+#include <uORB/topics/airlink_pair_command.h>
+#include <uORB/topics/composite_attitude_estimate.h>
+#include <uORB/topics/composite_estimator_status.h>
+#include <uORB/topics/composite_control_reference.h>
+#include <uORB/topics/composite_control_status.h>
+#include <uORB/topics/actuator_servos.h>
+#include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/vehicle_angular_velocity.h>
+#include <uORB/topics/vehicle_acceleration.h>
+#include <uORB/topics/vehicle_local_position.h>
+#include <uORB/topics/manual_control_setpoint.h>
+#include <uORB/topics/logger_status.h>
 
 #include <stddef.h>
 
@@ -50,10 +68,12 @@ private:
 	void readSerial();
 	void parseRxBuffer();
 	void handlePacket(const gs_link::Header &header, const uint8_t *payload);
+	void handleMocapAttitude(const gs_link::Header &header, const uint8_t *payload);
 	void handleRc(const gs_link::Header &header, const uint8_t *payload);
 	void handleCommand(const gs_link::Header &header, const uint8_t *payload);
 	void handleHeartbeat(const gs_link::Header &header, const uint8_t *payload);
 	void sendTelemetry(hrt_abstime now);
+	void sendDiagnostics(hrt_abstime now);
 	void sendHeartbeat(hrt_abstime now);
 	void sendAck(uint8_t acked_class, uint8_t acked_id, uint16_t acked_seq,
 		     gs_link::AckResult result, uint32_t echo_token);
@@ -93,9 +113,56 @@ private:
 	rc_channels_s _rc_channels{};
 	vehicle_attitude_s _vehicle_attitude{};
 
+	uORB::Subscription _diag_airlink_status_sub{ORB_ID(airlink_status)};
+	airlink_status_s _diag_airlink_status{};
+	uORB::Subscription _diag_airlink_health_sub{ORB_ID(airlink_health)};
+	airlink_health_s _diag_airlink_health{};
+	uORB::Subscription _diag_airlink_actuator_command_sub{ORB_ID(airlink_actuator_command)};
+	airlink_actuator_command_s _diag_airlink_actuator_command{};
+	uORB::Subscription _diag_airlink_pair_command_sub{ORB_ID(airlink_pair_command)};
+	airlink_pair_command_s _diag_airlink_pair_command{};
+	uORB::Subscription _diag_composite_attitude_estimate_sub{ORB_ID(composite_attitude_estimate)};
+	composite_attitude_estimate_s _diag_composite_attitude_estimate{};
+	uORB::Subscription _diag_composite_estimator_status_sub{ORB_ID(composite_estimator_status)};
+	composite_estimator_status_s _diag_composite_estimator_status{};
+	uORB::Subscription _diag_composite_control_reference_sub{ORB_ID(composite_control_reference)};
+	composite_control_reference_s _diag_composite_control_reference{};
+	uORB::Subscription _diag_composite_control_status_sub{ORB_ID(composite_control_status)};
+	composite_control_status_s _diag_composite_control_status{};
+	uORB::Subscription _diag_actuator_servos_sub{ORB_ID(actuator_servos)};
+	actuator_servos_s _diag_actuator_servos{};
+	uORB::Subscription _diag_vehicle_status_sub{ORB_ID(vehicle_status)};
+	vehicle_status_s _diag_vehicle_status{};
+	uORB::Subscription _diag_vehicle_angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
+	vehicle_angular_velocity_s _diag_vehicle_angular_velocity{};
+	uORB::Subscription _diag_vehicle_acceleration_sub{ORB_ID(vehicle_acceleration)};
+	vehicle_acceleration_s _diag_vehicle_acceleration{};
+	uORB::Subscription _diag_vehicle_local_position_sub{ORB_ID(vehicle_local_position)};
+	vehicle_local_position_s _diag_vehicle_local_position{};
+	uORB::Subscription _diag_manual_control_setpoint_sub{ORB_ID(manual_control_setpoint)};
+	manual_control_setpoint_s _diag_manual_control_setpoint{};
+	uORB::Subscription _diag_logger_status_sub{ORB_ID(logger_status)};
+	logger_status_s _diag_logger_status{};
+	uORB::Subscription _diag_actuator_motors_sub{ORB_ID(actuator_motors)};
+	actuator_motors_s _diag_actuator_motors{};
+	bool _pair_control_requested{false};
+	uORB::Publication<vehicle_odometry_s> _mocap_pub{ORB_ID(vehicle_visual_odometry)};
+	uint32_t _mocap_session{0};
+	uint32_t _mocap_sequence{0};
+	hrt_abstime _mocap_sample_time{0};
+	uint8_t _mocap_reset_counter{0};
 	uint32_t _session_id{0};
 	uint32_t _gs_session_id{0};
 	uint16_t _tx_sequence{0};
+	// Receive diagnostics, written only by the owning work queue.
+	uint32_t _read_calls{0}, _read_bytes{0}, _read_empty{0}, _read_eagain{0}, _read_errors{0};
+	int _last_read_errno{0};
+	int _rx_available_last{0}, _rx_available_max{0};
+	uint32_t _rx_discarded_bytes{0}, _rx_buffer_overflows{0};
+	uint32_t _rx_heartbeats{0}, _rx_sync_requests{0}, _tx_sync_replies{0}, _rx_unknown_data{0};
+	hrt_abstime _last_rx_byte_time{0};
+	uint8_t _rx_first_bytes[32]{}, _rx_last_bytes[32]{};
+	uint8_t _rx_first_len{0}, _rx_last_len{0};
 	uint32_t _rx_packets{0};
 	uint32_t _tx_packets{0};
 	uint32_t _crc_errors{0};

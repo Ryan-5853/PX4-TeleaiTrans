@@ -67,6 +67,7 @@ enum class MessageId : uint8_t {
 	LinkHandshake = 0x09,
 	LinkTestControl = 0x0A,
 	LinkTestData = 0x0B,
+	LinkTiming = 0x0C, // 8-byte local-clock token, optional low-rate RTT probe
 };
 
 enum FrameFlags : uint8_t {
@@ -122,7 +123,9 @@ enum CapabilityFlags : uint32_t {
 	SensorStateV1 = 1u << 6,
 	Output2M3s = 1u << 7,
 	CompositeYawReference = 1u << 8,
-	ReservedCapabilityFlags = 0xFFFFFE00u,
+	RuntimeTiming = 1u << 9,
+	EstimatorKill = 1u << 10,
+	ReservedCapabilityFlags = 0xFFFFF800u,
 };
 
 enum HandshakeStateFlags : uint32_t {
@@ -151,6 +154,7 @@ enum class ReasonCode : uint8_t {
 	InvalidCommand = 8,
 	EmergencyTrigger = 9,
 	Other = 10,
+	EstimatorInvalid = 11,
 };
 
 enum class AckResult : uint8_t {
@@ -431,6 +435,10 @@ inline bool valid_frame_flags(FrameType frame_type, uint8_t message_id, uint8_t 
 			return flags == 0;
 		}
 
+		if (message_id == static_cast<uint8_t>(MessageId::LinkTiming)) {
+			return flags == 0 || flags == Response;
+		}
+
 		if (message_id == static_cast<uint8_t>(MessageId::LinkTestData)) {
 			return flags == 0 || flags == Response;
 		}
@@ -488,6 +496,10 @@ inline bool expected_payload_length(FrameType frame_type, uint8_t message_id, ui
 
 		case MessageId::YawReference:
 			minimum = maximum = kYawReferencePayloadSize;
+			return true;
+
+		case MessageId::LinkTiming:
+			minimum = maximum = 8;
 			return true;
 
 		case MessageId::LinkTestData:
@@ -1157,7 +1169,9 @@ inline bool decode_actuator_command(const uint8_t *payload, uint16_t payload_len
 	command.lower_motor = lower_code / 500.f;
 
 	for (int i = 0; i < 3; ++i) {
-		command.servos[i] = servo_codes[i] / 500.f - 1.f;
+		// Center in the integer domain so both endpoints and neutral are
+		// exact, including when the compiler uses reciprocal multiplication.
+		command.servos[i] = (static_cast<int32_t>(servo_codes[i]) - 500) / 500.f;
 	}
 
 	return true;
@@ -1189,7 +1203,7 @@ inline bool encode_reliable_event(const ReliableEvent &event,
 				  uint8_t payload[kReliableEventPayloadSize])
 {
 	if (event.target_peer_session == 0 || event.event_id == 0 || event.event_flags != 0
-	    || event.reserved != 0 || static_cast<uint8_t>(event.reason_code) > 10) {
+	    || event.reserved != 0 || static_cast<uint8_t>(event.reason_code) > 11) {
 		return false;
 	}
 
@@ -1214,7 +1228,7 @@ inline bool decode_reliable_event(const uint8_t *payload, uint16_t payload_len,
 	event.event_flags = payload[9];
 	event.reserved = read_u16(payload + 10);
 	return event.target_peer_session != 0 && event.event_id != 0
-	       && static_cast<uint8_t>(event.reason_code) <= 10
+	       && static_cast<uint8_t>(event.reason_code) <= 11
 	       && event.event_flags == 0 && event.reserved == 0;
 }
 

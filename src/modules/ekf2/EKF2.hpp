@@ -317,6 +317,8 @@ private:
 #if defined(CONFIG_EKF2_EXTERNAL_VISION)
 	uORB::PublicationMulti<estimator_aid_source1d_s> _estimator_aid_src_ev_hgt_pub {ORB_ID(estimator_aid_src_ev_hgt)};
 	uORB::PublicationMulti<estimator_aid_source2d_s> _estimator_aid_src_ev_pos_pub{ORB_ID(estimator_aid_src_ev_pos)};
+	hrt_abstime _status_ev_att_pub_last{0};
+	uORB::PublicationMulti<estimator_aid_source3d_s> _estimator_aid_src_ev_att_pub{ORB_ID(estimator_aid_src_ev_att)};
 	uORB::PublicationMulti<estimator_aid_source3d_s> _estimator_aid_src_ev_vel_pub{ORB_ID(estimator_aid_src_ev_vel)};
 	uORB::PublicationMulti<estimator_aid_source1d_s> _estimator_aid_src_ev_yaw_pub{ORB_ID(estimator_aid_src_ev_yaw)};
 	hrt_abstime _status_ev_hgt_pub_last{0};

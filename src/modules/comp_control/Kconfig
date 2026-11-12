@@ -1,0 +1,4 @@
+menuconfig MODULES_COMP_CONTROL
+ bool "Independent composite pair controller"
+ default n
+ depends on MODULES_COMP_ATTITUDE

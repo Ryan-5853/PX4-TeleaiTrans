@@ -21,7 +21,7 @@ namespace
 
 constexpr uint8_t kMotor1Function{101};
 constexpr uint8_t kMotor2Function{102};
-constexpr uint8_t kConfigFormatVersion{2};
+constexpr uint8_t kConfigFormatVersion{4};
 constexpr uint8_t kOutputLayout2M3s{1};
 constexpr uint32_t kCollectiveNeutralMilli{500};
 constexpr uint32_t kCollectiveDescentMilli{250};
@@ -102,6 +102,7 @@ bool Airlink::init()
 
 	_applied_role = role;
 	_applied_pair_enable = _param_pair_enable.get() != 0 ? 1 : 0;
+	applyMaintainedArmSwitchConfig();
 	initializeSession(hrt_absolute_time());
 	ScheduleOnInterval(kRunInterval);
 	return true;
@@ -109,10 +110,16 @@ bool Airlink::init()
 
 void Airlink::initializeSession(uint64_t now_us)
 {
+	airlink_status_s previous{};
+	uORB::Subscription previous_status{ORB_ID(airlink_status)};
+	previous_status.copy(&previous);
+	_pair_lost_latched |= previous.pair_lost || previous.pair_reattach_latched;
+
 	_session_id = generateSessionId(now_us);
 	const airlink::Role role = static_cast<airlink::Role>(_applied_role);
 	airlink::LocalStatus local{};
-	local.pair_mode_selected = _applied_pair_enable != 0;
+	local.pair_mode_selected = _applied_role != static_cast<int32_t>(airlink::Role::Disabled)
+		&& _vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL3;
 	local.armed = _actuator_armed.armed;
 	local.airborne_latched = _airborne_latched;
 	local.pair_reattach_latched = _pair_lost_latched;
@@ -221,7 +228,8 @@ airlink::LocalStatus Airlink::makeLocalStatus(uint64_t now_us)
 				  && !_failsafe_flags.manual_control_signal_lost;
 	local.armed = _actuator_armed.armed;
 	local.airborne_latched = _airborne_latched;
-	local.pair_mode_selected = _applied_pair_enable != 0;
+	local.pair_mode_selected = _applied_role != static_cast<int32_t>(airlink::Role::Disabled)
+		&& _vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL3;
 	const bool gs_status_fresh = fresh_sample(now_us, _gs_link_status.timestamp,
 				    kGsLinkTimeout);
 	local.gs_link_valid = gs_status_fresh && !_gs_link_status.failsafe;
@@ -315,12 +323,14 @@ void Airlink::updateSubscriptions()
 	_failsafe_flags_sub.update(&_failsafe_flags);
 	_gs_link_status_sub.update(&_gs_link_status);
 	_input_rc_sub.update(&_input_rc);
+	_manual_switches_sub.update(&_manual_switches);
 	_imu_source.update();
 	_vehicle_angular_velocity_sub.update(&_vehicle_angular_velocity);
 	_vehicle_attitude_sub.update(&_vehicle_attitude);
 	_vehicle_command_ack_sub.update(&_vehicle_command_ack);
 	_vehicle_status_sub.update(&_vehicle_status);
 	_pair_command_sub.update(&_pair_command);
+	_estimate_sub.update(&_estimate);
 	_yaw_reference_sub.update(&_yaw_reference);
 }
 
@@ -335,6 +345,7 @@ void Airlink::updateParameters(bool force)
 	updateParams();
 	applyRequestedRole();
 	applyRequestedPairMode();
+	applyMaintainedArmSwitchConfig();
 	const uint32_t config_crc = computeConfigCrc32c();
 
 	if (config_crc != _config_crc32c && !_actuator_armed.armed
@@ -399,60 +410,113 @@ void Airlink::applyRequestedPairMode()
 	_applied_pair_enable = requested;
 }
 
+void Airlink::applyMaintainedArmSwitchConfig()
+{
+	if (_applied_role == static_cast<int32_t>(airlink::Role::Disabled)) {
+		return;
+	}
+	int32_t arm_channel = 0;
+	param_get(param_find("RC_MAP_ARM_SW"), &arm_channel);
+	_arm_switch_mapped = arm_channel > 0;
+	if (!_actuator_armed.armed) {
+		int32_t is_button = 0;
+		const param_t handle = param_find("COM_ARM_SWISBTN");
+		if (handle != PARAM_INVALID && param_get(handle, &is_button) == PX4_OK && is_button != 0) {
+			const int32_t maintained = 0;
+			param_set(handle, &maintained);
+			PX4_WARN("AIRLINK uses maintained RC arm switch: COM_ARM_SWISBTN=0");
+		}
+	}
+}
+
 void Airlink::handleExternalArming(uint64_t now_us)
 {
 	bool request_arm = false;
 	bool request_disarm = false;
+	const bool maintained = _arm_switch_mapped
+		&& _applied_role != static_cast<int32_t>(airlink::Role::Disabled)
+		&& _vehicle_status.hil_state != vehicle_status_s::HIL_STATE_ON;
+
+	if (maintained) {
+		const auto sw = _maintained_arm_switch.update(_manual_switches.timestamp_sample,
+			makeLocalStatus(now_us).local_rc_valid
+			&& fresh_sample(now_us, _manual_switches.timestamp_sample, kRcTimeout),
+			_manual_switches.arm_switch == manual_control_switches_s::SWITCH_POS_ON,
+			_manual_switches.arm_switch == manual_control_switches_s::SWITCH_POS_OFF);
+		_arm_switch_allowed = sw.arm_allowed;
+		_arm_switch_off = sw.off;
+		request_arm = sw.request_arm;
+		if (sw.request_disarm) {
+			_operator_disarm_pending = true;
+			request_disarm = true;
+		}
+		// OFF remains a stop gate if an old ACK/command arrives after the edge.
+		if (sw.off && (_actuator_armed.armed || _arm_command_active || _operator_arm_requested)) {
+			request_disarm = true;
+		}
+	} else {
+		// HIL keeps its existing MAVLink pilot/arming input, without a physical switch.
+		_arm_switch_allowed = true;
+		_arm_switch_off = false;
+	}
 
 	if (_vehicle_command_sub.update(&_vehicle_command)
 	    && _vehicle_command.from_external
 	    && _vehicle_command.command == vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM
 	    && PX4_ISFINITE(_vehicle_command.param1)) {
-		request_arm = _vehicle_command.param1 > 0.5f;
-		request_disarm = !request_arm;
+		request_arm |= _vehicle_command.param1 > 0.5f;
+		request_disarm |= _vehicle_command.param1 <= 0.5f;
 	}
 
-	if (_action_request_sub.update(&_action_request)) {
+	// Drain the event queue. Mapped physical ARM/DISARM is owned by the fresh
+	// switch state above, so delayed button/toggle events cannot invert it.
+	while (_action_request_sub.update(&_action_request)) {
+		const bool physical_rc = _action_request.source == action_request_s::SOURCE_STICK_GESTURE
+			|| _action_request.source == action_request_s::SOURCE_RC_SWITCH
+			|| _action_request.source == action_request_s::SOURCE_RC_BUTTON;
+		if (maintained && physical_rc) {
+			continue;
+		}
+		if (physical_rc && (_action_request.action == action_request_s::ACTION_DISARM
+		    || (_action_request.action == action_request_s::ACTION_TOGGLE_ARMING && _actuator_armed.armed))) {
+			_operator_disarm_pending = true;
+		}
 		switch (_action_request.action) {
 		case action_request_s::ACTION_ARM:
 			request_arm = true;
 			break;
-
 		case action_request_s::ACTION_DISARM:
 			request_disarm = true;
 			break;
-
 		case action_request_s::ACTION_TOGGLE_ARMING:
-			request_arm = !_actuator_armed.armed;
-			request_disarm = _actuator_armed.armed;
+			request_arm |= !_actuator_armed.armed;
+			request_disarm |= _actuator_armed.armed;
 			break;
-
 		default:
 			break;
 		}
 	}
 
-	if (request_arm) {
-		if (_applied_pair_enable == 0
+	if (maintained && !_arm_switch_allowed) {
+		request_arm = false;
+	}
+	if (request_disarm) {
+		_operator_arm_requested = false;
+		_commands.fetch_or(CommandDisarm);
+	} else if (request_arm) {
+		if (!makeLocalStatus(now_us).pair_mode_selected
 		    || _applied_role != static_cast<int32_t>(airlink::Role::Master)
 		    || _actuator_armed.armed) {
 			return;
 		}
-
 		if (_session.link_test_active()) {
 			_commands.fetch_or(CommandLinkTestAbort);
 			return;
 		}
-
 		_operator_arm_requested = true;
-
 		if (_session.state() == airlink::LinkState::Ready) {
 			(void)_session.request_control_enable(now_us);
 		}
-
-	} else if (request_disarm) {
-		_operator_arm_requested = false;
-		_commands.fetch_or(CommandDisarm);
 	}
 }
 
@@ -539,6 +603,7 @@ void Airlink::parseFrames(uint64_t now_us, airlink::SessionActions &actions)
 	airlink::Frame frame{};
 
 	while (_parser.next(frame)) {
+		now_us = hrt_absolute_time();
 		airlink::ActuatorCommand command{};
 		const bool actuator_candidate =
 			frame.header.frame_type == airlink::FrameType::Command
@@ -559,6 +624,10 @@ void Airlink::parseFrames(uint64_t now_us, airlink::SessionActions &actions)
 			&& decode_yaw_reference(frame.payload, frame.header.payload_len, yaw_reference);
 		const airlink::SessionActions received = _session.receive(frame, now_us);
 		mergeActions(actions, received);
+		if (_health_peer_session != _session.peer_session_id()) {
+			_health_peer_session = _session.peer_session_id();
+			_health.sessionChanged();
+		}
 
 		if (sensor_candidate && _applied_role == static_cast<int32_t>(airlink::Role::Master)
 		    && frame.header.source_role == airlink::Role::Slave
@@ -567,6 +636,8 @@ void Airlink::parseFrames(uint64_t now_us, airlink::SessionActions &actions)
 					       && frame.header.sequence == _sensor_last_sequence;
 
 			if (!duplicate) {
+				_health.rx.sample(now_us);
+				_health.peerImu(airlink::sensor_imu_valid(sensor.status_flags, sensor.imu_sample_time_us));
 				publishPeerSensor(frame, sensor, now_us);
 				_sensor_last_sequence = frame.header.sequence;
 				_sensor_has_last_sequence = true;
@@ -594,6 +665,7 @@ void Airlink::parseFrames(uint64_t now_us, airlink::SessionActions &actions)
 			 && frame.header.sequence == _last_received_control_sequence)
 		    && (_session.state() == airlink::LinkState::PairActive
 			|| _session.state() == airlink::LinkState::PairArmPending)) {
+			_health.rx.sample(now_us);
 			_last_received_control_us = now_us;
 			_last_received_control_sequence = frame.header.sequence;
 			_last_received_control_session = frame.header.source_session;
@@ -639,6 +711,13 @@ bool Airlink::writeFrame(const airlink::Frame &frame)
 
 	if (sent == frame_len) {
 		_last_write_errno = 0;
+		const bool periodic = (_applied_role == static_cast<int32_t>(airlink::Role::Master)
+		    && frame.header.frame_type == airlink::FrameType::Command
+		    && frame.header.message_id == static_cast<uint8_t>(airlink::MessageId::ActuatorCommand))
+		    || (_applied_role == static_cast<int32_t>(airlink::Role::Slave)
+		    && frame.header.frame_type == airlink::FrameType::Data
+		    && frame.header.message_id == static_cast<uint8_t>(airlink::MessageId::SensorState));
+		if (periodic) _health.tx.sample(hrt_absolute_time());
 		return true;
 	}
 
@@ -660,6 +739,16 @@ void Airlink::flushTx()
 
 void Airlink::issueVehicleArm(bool arm, uint64_t now_us)
 {
+	if (arm && _arm_switch_mapped && !_arm_switch_allowed) {
+		_operator_arm_requested = false;
+		(void)_session.notify_local_arm_result(false, now_us);
+		if (_applied_role == static_cast<int32_t>(airlink::Role::Master)) {
+			(void)_session.request_pair_disarm(airlink::ReasonCode::OperatorRequest, now_us);
+		}
+		PX4_WARN("AIRLINK local arm blocked: fresh RC OFF->ON required");
+		return;
+	}
+
 	if (!arm && now_us - _last_disarm_request_us < kDisarmRepeatInterval
 	    && _last_disarm_request_us != 0) {
 		return;
@@ -674,6 +763,9 @@ void Airlink::issueVehicleArm(bool arm, uint64_t now_us)
 	command.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
 	command.param1 = arm ? vehicle_command_s::ARMING_ACTION_ARM
 			 : vehicle_command_s::ARMING_ACTION_DISARM;
+	if (!arm) {
+		command.param2 = 21196.f; // PX4 forced disarm, including airborne fault/RC disarm.
+	}
 	command.target_system = _vehicle_status.system_id;
 	command.target_component = _vehicle_status.component_id;
 	command.source_system = _vehicle_status.system_id;
@@ -759,7 +851,7 @@ airlink::ActuatorCommand Airlink::toActuatorCommand(const float motors[2],
 bool Airlink::pairCommandValid(const airlink_pair_command_s &command,
 			       uint64_t now_us) const
 {
-	return command.valid
+	return !_estimate_guard.faulted() && pair_estimate_safety::healthy(_estimate, now_us) && command.valid
 	       && fresh_sample(now_us, command.timestamp, airlink::kSensorFreshTimeoutUs)
 	       && airlink::actuator_command_is_valid(
 		       toActuatorCommand(command.follower_motors, command.follower_servos))
@@ -767,13 +859,40 @@ bool Airlink::pairCommandValid(const airlink_pair_command_s &command,
 		       toActuatorCommand(command.master_motors, command.master_servos));
 }
 
+void Airlink::checkEstimateKill(uint64_t now_us, airlink::SessionActions &actions)
+{
+	if (_applied_role != static_cast<int32_t>(airlink::Role::Master)) return;
+	_estimate_sub.update(&_estimate);
+	now_us = hrt_absolute_time();
+	const auto state = _session.state();
+	const bool protected_pair = (_actuator_armed.armed && makeLocalStatus(now_us).pair_mode_selected)
+	    || state == airlink::LinkState::PairArmPending || state == airlink::LinkState::PairArmedGround
+	    || state == airlink::LinkState::PairActive;
+	_estimate_guard.update(protected_pair, _estimate, now_us);
+	if (protected_pair) {
+		const auto &sensor = _session.peer_sensor_state();
+		if (_session.last_peer_sensor_age_us(now_us) > airlink::kSensorFreshTimeoutUs
+		    || !airlink::sensor_imu_valid(sensor.status_flags, sensor.imu_sample_time_us)) {
+			_estimate_guard.trip(pair_estimate_safety::Fault::Source);
+		}
+	}
+	if (_estimate_guard.faulted() && !_pair_lost_latched) {
+		PX4_ERR("CEKF safety fault %u: KILL both aircraft", static_cast<unsigned>(_estimate_guard.fault()));
+		const auto kill = _session.fail_estimator(now_us);
+		mergeActions(actions, kill);
+		handleActions(kill, now_us); // Publish the latch and force disarm before any more control/ARM work.
+	}
+}
+
 void Airlink::handleCommands(uint64_t now_us)
 {
-	const uint32_t commands = _commands.fetch_and(0);
-
-	if (commands == 0 && !_operator_arm_requested) {
+	if (_pair_lost_latched || _session.pair_reattach_latched()) {
+		_operator_arm_requested = false;
+		issueVehicleArm(false, now_us);
+		_commands.fetch_and(0);
 		return;
 	}
+	const uint32_t commands = _commands.fetch_and(0);
 
 	if ((commands & CommandSensorTest) != 0) {
 		_sensor_test_start_rx = _sensor_rx_frames;
@@ -790,8 +909,12 @@ void Airlink::handleCommands(uint64_t now_us)
 	}
 
 	if ((commands & CommandArm) != 0) {
-		if (_applied_role != static_cast<int32_t>(airlink::Role::Master)) {
-			PX4_WARN("AIRLINK pair arm requires the master role");
+		if (_arm_switch_mapped && !_arm_switch_allowed) {
+			PX4_WARN("AIRLINK pair arm blocked: fresh RC OFF->ON required");
+
+		} else if (_applied_role != static_cast<int32_t>(airlink::Role::Master)
+		    || !makeLocalStatus(now_us).pair_mode_selected) {
+			PX4_WARN("AIRLINK pair arm requires master External Mode 3");
 
 		} else if (_session.state() == airlink::LinkState::Ready) {
 			_operator_arm_requested = true;
@@ -871,7 +994,7 @@ void Airlink::handleCommands(uint64_t now_us)
 	}
 
 	if (_applied_role == static_cast<int32_t>(airlink::Role::Master)
-	    && _applied_pair_enable != 0 && _session.state() == airlink::LinkState::Ready
+	    && makeLocalStatus(now_us).pair_mode_selected && _session.state() == airlink::LinkState::Ready
 	    && pairCommandValid(_pair_command, now_us)
 	    && (_last_enable_attempt_us == 0
 		|| now_us - _last_enable_attempt_us > 100'000)) {
@@ -879,6 +1002,9 @@ void Airlink::handleCommands(uint64_t now_us)
 		(void)_session.request_control_enable(now_us);
 	}
 
+	if (_arm_switch_mapped && !_arm_switch_allowed) {
+		_operator_arm_requested = false;
+	}
 	if (_operator_arm_requested
 	    && _applied_role == static_cast<int32_t>(airlink::Role::Master)
 	    && _session.state() == airlink::LinkState::PairControlReady) {
@@ -895,8 +1021,15 @@ void Airlink::handleCommands(uint64_t now_us)
 
 void Airlink::handleActions(const airlink::SessionActions &actions, uint64_t now_us)
 {
-	if (actions.request_arm) {
-		issueVehicleArm(true, now_us);
+	if (actions.request_arm && !actions.request_disarm && !actions.pair_lost) {
+		if (_applied_role == static_cast<int32_t>(airlink::Role::Slave)
+		    && _arm_switch_mapped && !_arm_switch_allowed) {
+			// The two RC receivers need not publish the ON edge in the same cycle.
+			// Wait within the arm transaction timeout, never arm while still OFF.
+			_maintained_arm_switch.deferArm(now_us + kArmCommandTimeout);
+		} else {
+			issueVehicleArm(true, now_us);
+		}
 	}
 
 	if (actions.request_disarm) {
@@ -912,6 +1045,9 @@ void Airlink::handleActions(const airlink::SessionActions &actions, uint64_t now
 
 	if (actions.pair_lost) {
 		_pair_lost_latched = true;
+		_operator_arm_requested = false;
+		publishStatus(now_us, true);
+		issueVehicleArm(false, now_us);
 	}
 
 	if (actions.link_test_finished) {
@@ -944,9 +1080,11 @@ void Airlink::publishFollowerCommand(uint64_t now_us)
 
 void Airlink::publishStatus(uint64_t now_us, bool pair_lost)
 {
+	now_us = hrt_absolute_time();
 	airlink_status_s status{};
 	status.timestamp = now_us;
 	status.timestamp_sample = now_us;
+	status.operator_disarm_timestamp = _operator_disarm_timestamp;
 	status.session_id = _session_id;
 	status.peer_session_id = _session.peer_session_id();
 	status.protocol_version = airlink::kVersion;
@@ -965,7 +1103,7 @@ void Airlink::publishStatus(uint64_t now_us, bool pair_lost)
 	status.pair_lost = _pair_lost_latched || pair_lost
 			   || _session.state() == airlink::LinkState::PairLost;
 	status.pair_reattach_latched = _session.pair_reattach_latched();
-	status.pair_mode_selected = _applied_pair_enable != 0;
+	status.pair_mode_selected = makeLocalStatus(now_us).pair_mode_selected;
 	status.local_airborne_latched = _airborne_latched;
 	status.local_arm_authorized = _arm_command_active
 				      && _session.state() == airlink::LinkState::PairArmPending;
@@ -985,6 +1123,63 @@ void Airlink::publishStatus(uint64_t now_us, bool pair_lost)
 	status.reliable_retries = _session.reliable_retries();
 	status.duplicate_events = _session.duplicate_events();
 	status.write_failures = _write_failures;
+	airlink_health_s health{};
+	health.timestamp = now_us;
+	const auto &timing = _session.timing_health();
+	const bool expect_stream = _session.peer_session_id() != 0
+	    && _session.state() >= airlink::LinkState::Ready && _session.state() != airlink::LinkState::PairLost
+	    && (_applied_role == static_cast<int32_t>(airlink::Role::Master)
+	        || _session.state() == airlink::LinkState::PairActive);
+	airlink::health_peak(_health.local_imu_age_max_us, airlink::health_elapsed(now_us, _imu_source.timestampSample()));
+	const uint64_t attitude_sample = _vehicle_attitude.timestamp_sample ? _vehicle_attitude.timestamp_sample : _vehicle_attitude.timestamp;
+	const uint64_t rates_sample = _vehicle_angular_velocity.timestamp_sample ? _vehicle_angular_velocity.timestamp_sample : _vehicle_angular_velocity.timestamp;
+	const uint32_t core_age = airlink::maximum(
+		airlink::maximum(airlink::health_elapsed(now_us, _imu_source.timestampSample()),
+			airlink::health_elapsed(now_us, _imu_source.accelerationTimestamp())),
+		airlink::maximum(airlink::health_elapsed(now_us, attitude_sample), airlink::health_elapsed(now_us, rates_sample)));
+	airlink::health_peak(_health.local_core_age_max_us, core_age);
+	const bool core_stale = core_age > kPeerFreshTimeout;
+	if (core_stale && !_health.local_core_stale) ++_health.local_core_stale_events;
+	_health.local_core_stale = core_stale;
+	health.local_core_age_us = core_age;
+	health.local_core_age_max_us = _health.local_core_age_max_us;
+	health.local_core_stale_events = _health.local_core_stale_events;
+	health.health_flags = (_health.rx.last ? 1u : 0u) | (_health.tx.last ? 2u : 0u) | (timing.peer_session == _session.peer_session_id() && timing.peer_session != 0 && airlink::health_elapsed(now_us, timing.last_reply) <= 1000000 ? 4u : 0u) | (_health.stream_stale ? 8u : 0u) | (_health.peer_imu_invalid ? 16u : 0u) | (expect_stream ? 32u : 0u) | (!core_stale ? 64u : 0u);
+	health.run_interval_us = _health.run.current;
+	health.run_interval_max_us = _health.run.maximum;
+	health.run_over_10ms = _health.run.over_limit;
+	health.run_work_us = _health.work_us;
+	health.run_work_max_us = _health.work_max_us;
+	health.rx_interval_us = _health.rx.current;
+	health.rx_interval_max_us = _health.rx.maximum;
+	health.rx_over_10ms = _health.rx.over_limit;
+	health.tx_interval_us = _health.tx.current;
+	health.tx_interval_max_us = _health.tx.maximum;
+	health.tx_over_10ms = _health.tx.over_limit;
+	health.rx_age_us = airlink::health_elapsed(now_us, _health.rx.last);
+	health.rx_age_max_us = _health.rx_age_max_us;
+	health.stream_timeouts = _health.stream_timeouts;
+	health.peer_sensor_age_us = _session.last_peer_sensor_age_us(now_us);
+	health.peer_control_age_us = _session.last_peer_control_age_us(now_us);
+	health.peer_link_age_us = _session.last_peer_age_us(now_us);
+	health.peer_imu_invalid_packets = _health.peer_imu_invalid_packets;
+	health.peer_imu_invalid_events = _health.peer_imu_invalid_events;
+	health.local_imu_age_us = airlink::health_elapsed(now_us, _imu_source.timestampSample());
+	health.local_imu_age_max_us = _health.local_imu_age_max_us;
+	health.rtt_us = timing.rtt_us;
+	health.rtt_max_us = timing.rtt_max_us;
+	health.rtt_age_us = airlink::health_elapsed(now_us, timing.last_reply);
+	health.rtt_samples = timing.samples;
+	health.rtt_timeouts = timing.timeouts;
+	health.rtt_over_10ms = timing.over_limit;
+	health.length_errors = status.length_errors;
+	health.version_errors = status.version_errors;
+	health.eof_errors = status.eof_errors;
+	health.resyncs = status.resyncs;
+	health.partial_timeouts = status.partial_timeouts;
+	health.buffer_overflows = status.buffer_overflows;
+	health.unknown_messages = status.unknown_messages;
+	_health_pub.publish(health);
 	_status_pub.publish(status);
 }
 
@@ -1038,7 +1233,8 @@ void Airlink::publishTestJson(uint64_t now_us)
 		 "\"missing\":%lu,\"duplicate\":%lu,\"reordered\":%lu,"
 		 "\"rtt_min_us\":%lu,\"rtt_mean_us\":%lu,\"rtt_p50_us\":%lu,"
 		 "\"rtt_p95_us\":%lu,\"rtt_p99_us\":%lu,\"rtt_max_us\":%lu,"
-		 "\"rtt_jitter_us\":%lu,\"offered_bps\":%lu,\"echo_bps\":%lu,"
+		 "\"rtt_jitter_us\":%lu,\"max_receive_gap_us\":%lu,\"link_interruptions\":%lu,"
+		 "\"offered_bps\":%lu,\"echo_bps\":%lu,"
 		 "\"bidirectional_bps\":%lu,\"buffer_overflows\":%lu}",
 		 static_cast<unsigned long>(_session.link_test_id()),
 		 static_cast<unsigned long>(stats.sent),
@@ -1053,6 +1249,8 @@ void Airlink::publishTestJson(uint64_t now_us)
 		 static_cast<unsigned long>(stats.rtt_p99_us),
 		 static_cast<unsigned long>(stats.rtt_max_us),
 		 static_cast<unsigned long>(stats.rtt_jitter_us),
+		 static_cast<unsigned long>(stats.max_receive_gap_us),
+		 static_cast<unsigned long>(stats.link_interruptions),
 		 static_cast<unsigned long>(stats.offered_bytes_per_second),
 		 static_cast<unsigned long>(stats.echo_bytes_per_second),
 		 static_cast<unsigned long>(stats.bidirectional_bytes_per_second),
@@ -1075,23 +1273,77 @@ void Airlink::Run()
 		return;
 	}
 
-	const hrt_abstime now = hrt_absolute_time();
+	const hrt_abstime run_start = hrt_absolute_time();
+	hrt_abstime now = run_start;
+	_health.run.sample(now);
+	if (_health_peer_session != _session.peer_session_id()) {
+		_health_peer_session = _session.peer_session_id();
+		_health.sessionChanged();
+	}
+	const bool expect_rx = _session.peer_session_id() != 0
+	    && _session.state() >= airlink::LinkState::Ready && _session.state() != airlink::LinkState::PairLost
+	    && (_applied_role == static_cast<int32_t>(airlink::Role::Master)
+	        || _session.state() == airlink::LinkState::PairActive);
+	// Observe BEFORE reading: a late scheduler wake must not erase the stale episode.
+	_health.observe(now, expect_rx);
+	if (!expect_rx) _health.rx.last = 0;
+	if (_applied_role == static_cast<int32_t>(airlink::Role::Master)
+	    && !_session.query_control_tx_allowed(now)) _health.tx.last = 0;
 	updateSubscriptions();
 
 	if (_previous_armed && !_actuator_armed.armed) {
 		_airborne_latched = false;
+		applyMaintainedArmSwitchConfig();
+		if (!_pair_lost_latched && !_session.pair_reattach_latched()) {
+			_commands.fetch_or(CommandDisarm);
+		}
 	}
 
 	_previous_armed = _actuator_armed.armed;
 	updateParameters();
 	handleExternalArming(now);
+	const auto switch_arm = _maintained_arm_switch.pollArm(now,
+		_session.state() == airlink::LinkState::PairArmPending,
+		_operator_disarm_pending || _pair_lost_latched || _session.pair_reattach_latched());
+	if (switch_arm == airlink::MaintainedArmSwitch::PendingArm::Issue) {
+		issueVehicleArm(true, now);
+	} else if (switch_arm == airlink::MaintainedArmSwitch::PendingArm::Reject) {
+		(void)_session.notify_local_arm_result(false, now);
+		issueVehicleArm(false, now);
+	}
 	updateArmResult(now);
+	if (_operator_disarm_pending && !_actuator_armed.armed
+	    && makeLocalStatus(now).local_rc_valid) {
+		_session.set_armed(false);
+		if (_session.reset_after_operator_disarm(now)) {
+			_session_id = _session.session_id();
+			_parser.reset();
+			_pair_lost_latched = false;
+			_estimate_guard.acknowledge();
+			_airborne_latched = false;
+			_arm_command_active = false;
+			_operator_arm_requested = false;
+			_follower_control_published = false;
+			_last_received_control_us = 0;
+			_commands.fetch_and(0);
+			_operator_disarm_timestamp = now;
+			_operator_disarm_pending = false;
+			publishStatus(now, false);
+			PX4_INFO("AIRLINK RC disarm: fault cleared, new handshake required");
+		}
+	}
 	bool serial_open = openSerial();
 	airlink::SessionActions actions{};
 
 	if (serial_open) {
 		_session.set_local_status(makeLocalStatus(now));
 		readSerial(now, actions);
+		now = hrt_absolute_time();
+		checkEstimateKill(now, actions);
+		now = hrt_absolute_time();
+		if (actions.request_disarm) {
+			_operator_arm_requested = false;
+		}
 		handleCommands(now);
 
 		if (_applied_role == static_cast<int32_t>(airlink::Role::Slave)) {
@@ -1155,15 +1407,22 @@ void Airlink::Run()
 			_last_status_pub_us = now;
 		}
 
+		_session.queue_timing_probe(hrt_absolute_time());
 		flushTx();
 		finishSensorTest(now);
 
 	} else {
+		_session.set_local_status(makeLocalStatus(now));
+		checkEstimateKill(now, actions);
+		now = hrt_absolute_time();
+		handleActions(_session.tick(now), now);
+		handleCommands(now);
 		if (period_elapsed(now, _last_status_pub_us, kProtocolFramePeriod)) {
 			publishStatus(now, false);
 			_last_status_pub_us = now;
 		}
 	}
+	_health.work(run_start, hrt_absolute_time());
 }
 
 void Airlink::requestArm()
@@ -1319,7 +1578,10 @@ int Airlink::print_status()
 		 _applied_role == static_cast<int32_t>(airlink::Role::Slave)
 		 && _session.state() == airlink::LinkState::PairActive ? 1 : 0,
 		 _session.pair_reattach_latched() ? 1 : 0,
-		 _session.state() == airlink::LinkState::PairArmPending ? 1 : 0);
+		 _arm_command_active && _session.state() == airlink::LinkState::PairArmPending ? 1 : 0);
+	PX4_INFO("RC arm switch: mapped %d, OFF %d, arm edge qualified %d, disarm ack %llu us",
+		 _arm_switch_mapped ? 1 : 0, _arm_switch_off ? 1 : 0, _arm_switch_allowed ? 1 : 0,
+		 static_cast<unsigned long long>(_operator_disarm_timestamp));
 	PX4_INFO("local: armed %d, airborne latched %d, pair mode %ld, RC valid %d, safety allow %d",
 		 _actuator_armed.armed ? 1 : 0, _airborne_latched ? 1 : 0,
 		 static_cast<long>(_applied_pair_enable), _input_rc.rc_lost ? 0 : 1,

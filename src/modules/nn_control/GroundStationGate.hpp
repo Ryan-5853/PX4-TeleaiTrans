@@ -41,7 +41,7 @@ public:
 
 	struct Config {
 		bool enabled{false};
-		uint8_t mode_slot{6};
+		uint8_t mode_slot{4};
 		uint64_t entry_delay_us{100000};
 	};
 
@@ -116,7 +116,7 @@ inline GroundStationGate::Source GroundStationGate::update(const Config &config,
 	}
 
 	// Selecting any non-ground-station slot arms the next transition into
-	// mode 6. This makes manual mode the explicit RC fallback.
+	// the ground-station slot. This makes manual mode the explicit RC fallback.
 	if (!requested_mode) {
 		_entry_authorized = true;
 		_selected_since = 0;
@@ -127,7 +127,7 @@ inline GroundStationGate::Source GroundStationGate::update(const Config &config,
 	// The physical RC switch can become visible one control cycle before
 	// Commander publishes the matching external nav_state. Keep RC selected
 	// and preserve the authorization acquired while the pilot was in manual;
-	// otherwise that ordinary transient permanently disables mode 6 until the
+	// otherwise that ordinary transient permanently disables the ground-station slot until the
 	// pilot deselects and reselects it.
 	if (!input.external_mode_active) {
 		if (_source == Source::GroundStation) {
@@ -140,7 +140,7 @@ inline GroundStationGate::Source GroundStationGate::update(const Config &config,
 	}
 
 	// A stream interruption while ground-station control is active is a
-	// hard interruption, not a pause. The pilot must leave and reselect mode 6
+	// hard interruption, not a pause. The pilot must leave and reselect the ground-station slot
 	// after the stream returns.
 	if (_source == Source::GroundStation && !input.ground_station_valid) {
 		_entry_authorized = false;

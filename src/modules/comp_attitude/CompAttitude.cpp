@@ -122,8 +122,35 @@ void CompAttitude::applyEkfParameters()
 	_ekf->updateParameters();
 }
 
+bool CompAttitude::protectedPair() const
+{
+	return _link.role == airlink_status_s::ROLE_MASTER
+	    && ((_actuator_armed.armed && _link.pair_mode_selected) || _link.pair_active || _link.local_arm_authorized);
+}
+
+void CompAttitude::faultEstimate(uint64_t now_us, uint16_t reason)
+{
+	if (!_estimate_fault_latched) {
+		_estimate_fault_latched = true;
+		_fault_reason = reason;
+		++_fault_epoch;
+		PX4_ERR("CEKF fault %u: estimate invalid until RC disarm acknowledgement", static_cast<unsigned>(reason));
+	}
+	_state = EstimatorState::Fault;
+	composite_attitude_estimate_s invalid{};
+	invalid.timestamp = now_us;
+	invalid.timestamp_sample = _local_imu.timestamp_us;
+	invalid.reset_counter = _reset_counter;
+	_estimate_pub.publish(invalid); // Persistent invalid publication cannot be missed as a one-cycle glitch.
+	publishStatus(now_us);
+}
+
 void CompAttitude::resetEstimator(uint64_t now_us, const char *reason)
 {
+	if (protectedPair()) {
+		faultEstimate(now_us, composite_estimator_status_s::FAULT_SESSION);
+		return; // Never reset integrators/covariance underneath an armed pair.
+	}
 	delete _ekf;
 	_ekf = new Ekf();
 	_external_attitude_initialized = false;
@@ -191,20 +218,43 @@ void CompAttitude::Run()
 		exit_and_cleanup();
 		return;
 	}
-	const uint64_t now_us = hrt_absolute_time();
-	updateParameters();
+	uint64_t now_us = hrt_absolute_time();
 	_actuator_armed_sub.update(&_actuator_armed);
+	_airlink_status_sub.update(&_link);
+	if (!_actuator_armed.armed && _link.operator_disarm_timestamp > _acknowledged_disarm) {
+		_acknowledged_disarm = _link.operator_disarm_timestamp;
+		if (_estimate_fault_latched) {
+			_estimate_fault_latched = false;
+			_fault_reason = composite_estimator_status_s::FAULT_NONE;
+			resetEstimator(now_us, "RC disarm acknowledgement");
+		}
+	}
+	updateParameters();
 	_vehicle_land_detected_sub.update(&_vehicle_land_detected);
 	_vehicle_attitude_sub.update(&_attitude_a);
 	const bool local_updated = updateLocalSource(now_us);
 	const bool peer_updated = _airlink_sensor_sub.update(&_peer_sensor);
 	_airlink_status_sub.update(&_link);
+	now_us = hrt_absolute_time();
 	// Link freshness belongs to Airlink. A scheduler tick without a packet is not a disconnect.
 	const bool peer_imu_valid = airlink::sensor_imu_valid(_peer_sensor.status_flags,
 				   _peer_sensor.imu_sample_time_us);
 	const bool connected = peer_imu_valid && _link.role == airlink_status_s::ROLE_MASTER
 	                       && _link.peer_heartbeat_fresh && _link.peer_sensor_fresh
-	                       && now_us >= _link.timestamp && now_us - _link.timestamp <= 100'000;
+	                       && pair_estimate_safety::fresh(now_us, _link.timestamp)
+	                       && pair_estimate_safety::fresh(now_us, _peer_sensor.timestamp);
+	if (_estimate_fault_latched) {
+		faultEstimate(now_us, _fault_reason);
+		return;
+	}
+	if (protectedPair() && (!_param_enabled.get() || !_ekf || !_external_attitude_initialized)) {
+		faultEstimate(now_us, composite_estimator_status_s::FAULT_EKF);
+		return;
+	}
+	if (protectedPair() && (!connected || !pair_estimate_safety::fresh(now_us, _local_imu.timestamp_us))) {
+		faultEstimate(now_us, composite_estimator_status_s::FAULT_SENSOR_STALE);
+		return;
+	}
 	const bool new_connection = connected && (!_peer_available || _peer_session != _link.peer_session_id);
 	_peer_available = connected;
 	_peer_session = _link.peer_session_id;
@@ -214,6 +264,7 @@ void CompAttitude::Run()
 	}
 	if (new_connection || (_commands.fetch_and(0) & 1u)) {
 		resetEstimator(now_us, new_connection ? "AIRLINK connected" : "CLI reset");
+		if (_estimate_fault_latched) return;
 	}
 	if (!initializeAttitudeFromLocalSources(now_us) && !_external_attitude_initialized) {
 		publishStatus(now_us);
@@ -316,8 +367,9 @@ void CompAttitude::publishEstimate(uint64_t now_us, const VirtualSample &sample,
 	                               sample.age_a_us > UINT32_MAX ? UINT32_MAX : sample.age_a_us);
 	estimate.source_age_b_us = static_cast<uint32_t>(
 	                               sample.age_b_us > UINT32_MAX ? UINT32_MAX : sample.age_b_us);
-	estimate.health_flags = composite_attitude_estimate_s::HEALTH_SOURCE_A_FRESH
-	                        | composite_attitude_estimate_s::HEALTH_EKF_VALID;
+	const bool ekf_valid = _ekf && _ekf->attitude_valid() && _ekf->fault_status().value == 0;
+	estimate.health_flags = composite_attitude_estimate_s::HEALTH_SOURCE_A_FRESH;
+	if (ekf_valid) estimate.health_flags |= composite_attitude_estimate_s::HEALTH_EKF_VALID;
 	if (_peer_available) {
 		estimate.health_flags |= composite_attitude_estimate_s::HEALTH_SOURCE_B_FRESH;
 	}
@@ -326,7 +378,11 @@ void CompAttitude::publishEstimate(uint64_t now_us, const VirtualSample &sample,
 		estimate.health_flags |= composite_attitude_estimate_s::HEALTH_DEGRADED;
 	}
 
-	estimate.valid = _state == EstimatorState::Ready || _state == EstimatorState::Degraded;
+	estimate.valid = ekf_valid && (_state == EstimatorState::Ready || _state == EstimatorState::Degraded);
+	if (protectedPair() && !pair_estimate_safety::healthy(estimate, now_us)) {
+		faultEstimate(now_us, composite_estimator_status_s::FAULT_NUMERICAL);
+		return;
+	}
 	_estimate_pub.publish(estimate);
 
 	mount_orientation_s mount{};
@@ -346,6 +402,8 @@ void CompAttitude::publishStatus(uint64_t now_us)
 	composite_estimator_status_s status{};
 	status.timestamp = now_us;
 	status.state = static_cast<uint8_t>(_state);
+	status.fault_reason = _fault_reason;
+	status.fault_epoch = _fault_epoch;
 	status.enabled = _param_enabled.get();
 	status.attitude_initialized = _external_attitude_initialized;
 	status.peer_connected = _peer_available;

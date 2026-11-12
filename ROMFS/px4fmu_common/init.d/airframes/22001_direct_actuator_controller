@@ -43,9 +43,18 @@ param set-default NN_AIRFRAME_ID 1
 # to COM_MODE1 so it is always assigned External Mode 2 (nav_state 24).
 param set COM_MODE0_HASH -301203826
 param set COM_MODE1_HASH -696130346
+param set COM_MODE2_HASH -70735788
+# The three-position switch selects slots 1/4/6. Override saved old mappings.
 param set-default RC_MAP_FLTMODE 8
-param set-default COM_FLTMODE1 0
-param set-default COM_FLTMODE6 101
+param set COM_FLTMODE1 0
+param set COM_FLTMODE4 101
+param set COM_FLTMODE6 102
+param set NN_GS_MODE_SLOT 4
+# Physical ARM is a maintained two-state switch, not a momentary button.
+# Override saved button-mode settings on both endpoints; keep existing channel mapping.
+param set COM_ARM_SWISBTN 0
+param set-default RC_MAP_ARM_SW 5
+
 
 # Physical outputs M1-M4 share TIM1, M5-M6 share TIM3 and M7-M8 share
 # TIM4. M1/M2 drive the upper/lower rotor motors; M6/M7/M8 drive the
@@ -56,8 +65,10 @@ param set-default COM_FLTMODE6 101
 # which doubled every ESC RPM entering the LQI observer.
 param set MOT_POLE_COUNT 28
 param set-default PWM_MAIN_TIM0 400
-param set-default PWM_MAIN_TIM1 333
-param set-default PWM_MAIN_TIM2 333
+# The three physical servos support 200 Hz PWM. Override saved 50 Hz values
+# so this frequency-only experiment takes effect on an existing airframe.
+param set PWM_MAIN_TIM1 200
+param set PWM_MAIN_TIM2 200
 
 param set-default PWM_MAIN_FUNC1 101
 param set-default PWM_MAIN_FUNC2 102
@@ -83,3 +94,21 @@ param set-default PWM_MAIN_DIS8 1500
 param set-default PWM_MAIN_FAIL6 1500
 param set-default PWM_MAIN_FAIL7 1500
 param set-default PWM_MAIN_FAIL8 1500
+
+# Preserve discovery, arm, disarm and fault tails on both pair endpoints.
+param set SDLOG_MODE 2
+
+# Match the direct collective-controller termination guard. Commander confirms
+# for 100 ms; NNControl independently cuts output without an added delay.
+param set FD_FAIL_R 30
+param set FD_FAIL_P 30
+param set FD_FAIL_R_TTRI 0.1
+param set FD_FAIL_P_TTRI 0.1
+
+# Restore PX4 automatic gyro selection for the replacement flight controller,
+# including saved priorities left by the BMI088-exclusive diagnostic build.
+# Keep calibration IDs/offsets intact; do not bind selection to the old board.
+param reset CAL_GYRO0_PRIO
+param reset CAL_GYRO1_PRIO
+param reset CAL_GYRO2_PRIO
+param reset CAL_GYRO3_PRIO

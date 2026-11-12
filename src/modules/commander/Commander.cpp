@@ -71,8 +71,32 @@
 #include <cstring>
 #include <matrix/math.hpp>
 
+#include <uORB/topics/airlink_status.h>
 #include <uORB/topics/mavlink_log.h>
 #include <uORB/topics/tune_control.h>
+
+// Faults inhibit arming until an explicit RC disarm acknowledges them.
+static bool ground_pair_fault_lock{false};
+static bool ground_pair_link_seen{false};
+
+static airlink_status_s ground_pair_status()
+{
+	airlink_status_s status{};
+	static uORB::Subscription sub{ORB_ID(airlink_status)};
+	sub.copy(&status);
+	const hrt_abstime now = hrt_absolute_time();
+	const bool fresh = status.timestamp != 0 && now >= status.timestamp && now - status.timestamp <= 10_ms;
+	static uint64_t operator_disarm_timestamp{0};
+	if (fresh && status.operator_disarm_timestamp > operator_disarm_timestamp) {
+		operator_disarm_timestamp = status.operator_disarm_timestamp;
+		ground_pair_fault_lock = false;
+		ground_pair_link_seen = false;
+	}
+	ground_pair_link_seen |= fresh && status.link_state >= airlink_status_s::STATE_READY;
+	ground_pair_fault_lock |= status.pair_lost || status.pair_reattach_latched
+		|| (ground_pair_link_seen && !fresh);
+	return status;
+}
 
 typedef enum VEHICLE_MODE_FLAG {
 	VEHICLE_MODE_FLAG_CUSTOM_MODE_ENABLED  = 1,   /* 0b00000001 Reserved for future use. | */
@@ -537,6 +561,19 @@ static constexpr const char *arm_disarm_reason_str(arm_disarm_reason_t calling_r
 
 transition_result_t Commander::arm(arm_disarm_reason_t calling_reason, bool run_preflight_checks)
 {
+	const airlink_status_s pair = ground_pair_status();
+	const hrt_abstime pair_now = hrt_absolute_time();
+	const bool composite_selected = _vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL3;
+	if (ground_pair_fault_lock) {
+		mavlink_log_critical(&_mavlink_log_pub, "Arming denied: AIRLINK fault lock (RC OFF required)");
+		return TRANSITION_DENIED;
+	}
+	if (composite_selected && (pair.timestamp == 0 || pair_now < pair.timestamp
+	    || pair_now - pair.timestamp > 10_ms || !pair.pair_mode_selected || !pair.local_arm_authorized)) {
+		mavlink_log_critical(&_mavlink_log_pub, "Arming denied: AIRLINK transaction not authorized");
+		return TRANSITION_DENIED;
+	}
+
 	if (isArmed()) {
 		return TRANSITION_NOT_CHANGED;
 	}
@@ -1648,6 +1685,17 @@ void Commander::executeActionRequest(const action_request_s &action_request)
 	case action_request_s::SOURCE_RC_BUTTON: arm_disarm_reason = arm_disarm_reason_t::rc_button; break;
 	}
 
+	const bool physical_rc = action_request.source == action_request_s::SOURCE_STICK_GESTURE
+		|| action_request.source == action_request_s::SOURCE_RC_SWITCH
+		|| action_request.source == action_request_s::SOURCE_RC_BUTTON;
+	if (physical_rc && _vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL3
+	    && (action_request.action == action_request_s::ACTION_ARM
+		|| (action_request.action == action_request_s::ACTION_TOGGLE_ARMING && !isArmed()))) {
+		// AIRLINK observes the same input and starts the coordinated transaction.
+		// Only its internally authorized command may arm either endpoint.
+		return;
+	}
+
 	switch (action_request.action) {
 	case action_request_s::ACTION_DISARM: disarm(arm_disarm_reason); break;
 
@@ -1675,6 +1723,7 @@ void Commander::executeActionRequest(const action_request_s &action_request)
 
 	case action_request_s::ACTION_KILL:
 		if (!_actuator_armed.manual_lockdown) {
+			_actuator_armed.manual_lockdown = true;
 			const char kill_switch_string[] = "Kill engaged\t";
 			events::LogLevels log_levels{events::Log::Info};
 
@@ -1689,7 +1738,6 @@ void Commander::executeActionRequest(const action_request_s &action_request)
 			events::send(events::ID("commander_kill_sw_engaged"), log_levels, "Kill engaged");
 
 			_status_changed = true;
-			_actuator_armed.manual_lockdown = true;
 		}
 
 		break;
@@ -1883,6 +1931,11 @@ void Commander::run()
 
 				executeActionRequest(action_request);
 			}
+		}
+
+		(void)ground_pair_status();
+		if (ground_pair_fault_lock) {
+			disarm(arm_disarm_reason_t::failsafe, true);
 		}
 
 		// update actuator_armed

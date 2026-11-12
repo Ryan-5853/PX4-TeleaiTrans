@@ -302,6 +302,10 @@ void EKF2::AdvertiseTopics()
 			_estimator_aid_src_ev_vel_pub.advertise();
 		}
 
+		if (_param_ekf2_ev_ctrl.get() & static_cast<int32_t>(EvCtrl::ATTITUDE)) {
+			_estimator_aid_src_ev_att_pub.advertise();
+		}
+
 		if (_param_ekf2_ev_ctrl.get() & static_cast<int32_t>(EvCtrl::YAW)) {
 			_estimator_aid_src_ev_yaw_pub.advertise();
 		}
@@ -980,6 +984,7 @@ void EKF2::PublishAidSourceStatus(const hrt_abstime &timestamp)
 	PublishAidSourceStatus(_ekf.aid_src_ev_hgt(), _status_ev_hgt_pub_last, _estimator_aid_src_ev_hgt_pub);
 	PublishAidSourceStatus(_ekf.aid_src_ev_pos(), _status_ev_pos_pub_last, _estimator_aid_src_ev_pos_pub);
 	PublishAidSourceStatus(_ekf.aid_src_ev_vel(), _status_ev_vel_pub_last, _estimator_aid_src_ev_vel_pub);
+	PublishAidSourceStatus(_ekf.aid_src_ev_att(), _status_ev_att_pub_last, _estimator_aid_src_ev_att_pub);
 	PublishAidSourceStatus(_ekf.aid_src_ev_yaw(), _status_ev_yaw_pub_last, _estimator_aid_src_ev_yaw_pub);
 #endif // CONFIG_EKF2_EXTERNAL_VISION
 

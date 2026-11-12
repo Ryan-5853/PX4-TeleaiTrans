@@ -7,6 +7,7 @@
 #include "NNControl.hpp"
 
 #include "FinalMotorOutputMap.hpp"
+#include "ActuatorOutputValidation.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -20,6 +21,9 @@
 static_assert(static_cast<int32_t>(events::util::hash_32_fnv1a_const("Ground Station")) == -696130346,
 	      "update COM_MODE1_HASH in airframe 22001 when the external mode name changes");
 
+static_assert(static_cast<int32_t>(events::util::hash_32_fnv1a_const("Composite")) == -70735788,
+	      "update COM_MODE2_HASH in airframe 22001 when the composite mode name changes");
+
 static_assert(nn_verification::request::kObservationFirst
 	      + ControllerBackend::kVerificationInputSize <= debug_array_s::ARRAY_SIZE,
 	      "NN verification request exceeds DEBUG_FLOAT_ARRAY capacity");
@@ -29,6 +33,25 @@ static_assert(nn_verification::response::kMacsPerInference
 
 namespace
 {
+
+// Reapply on module startup as well as airframe boot, so saved settings from
+// the previous slot-5/slot-6 layout cannot override the three-position switch.
+bool configureRcModeSlots()
+{
+	struct Mapping { const char *name; int32_t value; };
+	const Mapping mappings[] {{"COM_FLTMODE1", 0}, {"COM_FLTMODE4", 101},
+		{"COM_FLTMODE6", 102}, {"NN_GS_MODE_SLOT", 4}};
+	for (const auto &mapping : mappings) {
+		const param_t handle = param_find(mapping.name);
+		int32_t value{-1};
+		if (handle == PARAM_INVALID || param_get(handle, &value) != PX4_OK
+		    || (value != mapping.value && param_set(handle, &mapping.value) != PX4_OK)) {
+			PX4_ERR("cannot configure RC mode parameter %s", mapping.name);
+			return false;
+		}
+	}
+	return true;
+}
 
 constexpr float kRadianToDegree{57.29577951308232f};
 constexpr float kDefaultImpactAcceleration{35.f};
@@ -86,6 +109,16 @@ NNControl::~NNControl()
 		_unregister_ext_component_pub.publish(request);
 	}
 
+	if (_pair_mode_id >= 0) {
+		unregister_ext_component_s request{};
+		request.timestamp = hrt_absolute_time();
+		constexpr char name[] = "Composite";
+		memcpy(request.name, name, sizeof(name));
+		request.arming_check_id = _pair_arming_check_id;
+		request.mode_id = _pair_mode_id;
+		request.mode_executor_id = -1;
+		_unregister_ext_component_pub.publish(request);
+	}
 	_vehicle_angular_velocity_sub.unregisterCallback();
 	perf_free(_cycle_perf);
 	perf_free(_inference_perf);
@@ -97,6 +130,9 @@ NNControl::~NNControl()
 
 bool NNControl::init()
 {
+	if (!configureRcModeSlots()) {
+		return false;
+	}
 	updateParameters(true);
 
 	if (!_backend.init()) {
@@ -173,9 +209,22 @@ void NNControl::updateExternalModeRegistration(hrt_abstime now)
 	int max_updates = register_ext_component_reply_s::ORB_QUEUE_LENGTH;
 
 	while (_register_ext_component_reply_sub.update(&reply) && --max_updates >= 0) {
+		if (reply.request_id == _pair_registration_request && reply.success
+		    && reply.mode_id == vehicle_status_s::NAVIGATION_STATE_EXTERNAL3) {
+			_pair_mode_id = reply.mode_id;
+			_pair_arming_check_id = reply.arming_check_id;
+			vehicle_control_mode_s mode{};
+			mode.timestamp = now;
+			mode.source_id = _pair_mode_id;
+			mode.flag_control_manual_enabled = true;
+			mode.flag_control_attitude_enabled = true;
+			mode.flag_control_rates_enabled = true;
+			mode.flag_control_allocation_enabled = true;
+			_config_control_setpoints_pub.publish(mode);
+			PX4_INFO("Composite registered as External Mode 3");
+		}
 		if (!_external_mode_registered && reply.request_id == _external_mode_request_id) {
-			if (reply.success && reply.mode_id >= vehicle_status_s::NAVIGATION_STATE_EXTERNAL1
-			    && reply.mode_id <= vehicle_status_s::NAVIGATION_STATE_EXTERNAL8
+			if (reply.success && reply.mode_id == vehicle_status_s::NAVIGATION_STATE_EXTERNAL2
 			    && reply.arming_check_id >= 0) {
 				_external_mode_id = reply.mode_id;
 				_external_arming_check_id = reply.arming_check_id;
@@ -188,17 +237,17 @@ void NNControl::updateExternalModeRegistration(hrt_abstime now)
 					 external_mode_number, static_cast<int>(reply.mode_id),
 					 static_cast<int>(reply.arming_check_id));
 
-				// Keep RC mode slot 6 mapped to the actual registered external mode.
+				// Keep RC slot 4 on Ground Station; slot 6 belongs to Composite.
 				// PX4 does not let a component request a specific external mode index.
 				const int32_t configured_mode = 100 + static_cast<int32_t>(reply.mode_id)
 							       - vehicle_status_s::NAVIGATION_STATE_EXTERNAL1;
-				const param_t mode_param = param_find("COM_FLTMODE6");
+				const param_t mode_param = param_find("COM_FLTMODE4");
 				int32_t current_mode{-1};
 
 				if (mode_param != PARAM_INVALID && param_get(mode_param, &current_mode) == PX4_OK
 				    && current_mode != configured_mode) {
 					if (param_set(mode_param, &configured_mode) == PX4_OK) {
-						PX4_INFO("RC mode slot 6 mapped to External Mode %u", external_mode_number);
+						PX4_INFO("RC mode slot 4 mapped to External Mode %u", external_mode_number);
 					}
 				}
 
@@ -215,6 +264,31 @@ void NNControl::updateExternalModeRegistration(hrt_abstime now)
 		if (_external_mode_registered) {
 			publishArmingCheckReply(request);
 		}
+		if (_pair_arming_check_id >= 0) {
+			arming_check_reply_s pair_reply{};
+			pair_reply.timestamp = now;
+			pair_reply.request_id = request.request_id;
+			pair_reply.registration_id = _pair_arming_check_id;
+			pair_reply.health_component_index = arming_check_reply_s::HEALTH_COMPONENT_INDEX_NONE;
+			pair_reply.can_arm_and_run = !_pair_fault_latched && rcManualControlValid(now);
+			pair_reply.mode_req_manual_control = true;
+			pair_reply.mode_req_attitude = true;
+			pair_reply.mode_req_angular_velocity = true;
+			_arming_check_reply_pub.publish(pair_reply);
+		}
+	}
+
+	if (_external_mode_registered && _pair_registration_request == 0) {
+		_pair_registration_request = static_cast<uint64_t>(now) | 2;
+		register_ext_component_request_s pair{};
+		pair.timestamp = now;
+		pair.request_id = _pair_registration_request;
+		constexpr char name[] = "Composite";
+		memcpy(pair.name, name, sizeof(name));
+		pair.px4_ros2_api_version = register_ext_component_request_s::LATEST_PX4_ROS2_API_VERSION;
+		pair.register_mode = true;
+		pair.register_arming_check = true;
+		_register_ext_component_request_pub.publish(pair);
 	}
 
 	// Publish once. Retrying the same mode registration after a lost reply can
@@ -357,8 +431,10 @@ void NNControl::publishGsLinkStatus(hrt_abstime now)
 	status.armed = _actuator_armed.armed;
 	status.rc_valid = rcManualControlValid(now);
 	status.rc_switch_valid = _flight_mode_slot_valid;
-	status.rc_switch_selected = _ground_station_mode_selected;
-	status.gs_mode_active = _ground_station_gate.source() == GroundStationGate::Source::GroundStation;
+	status.rc_switch_selected = _ground_station_mode_selected
+		|| _vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL3;
+	status.gs_mode_active = _pair_gs_active
+		|| _ground_station_gate.source() == GroundStationGate::Source::GroundStation;
 	status.failsafe = _failsafe_flags.manual_control_signal_lost
 			  || _failsafe_flags.battery_unhealthy
 			  || _failsafe_flags.attitude_invalid
@@ -443,6 +519,40 @@ void NNControl::updateManualSource(hrt_abstime now)
 			PX4_INFO("manual source: RC (ground-station control interrupted)");
 		}
 	}
+}
+
+void NNControl::updatePairMode(hrt_abstime now)
+{
+	_pair_state_sub.update(&_pair_state);
+	now = hrt_absolute_time();
+	const bool selected = _pair_mode_id >= 0 && _vehicle_status.nav_state == _pair_mode_id;
+	composite_control_reference_s reference{};
+	reference.timestamp = now;
+	const bool state_fresh = _pair_state.valid && _pair_state.timestamp != 0
+		&& now >= _pair_state.timestamp && now - _pair_state.timestamp <= kAirlinkFreshness;
+	const bool active = selected && _airlink_status.role == airlink_status_s::ROLE_MASTER
+		&& !_pair_fault_latched && !_airlink_status.pair_reattach_latched
+		&& rcManualControlValid(now) && state_fresh;
+	_pair_gs_active = _pair_gs_gate.update(active && _actuator_armed.armed
+		&& _param_gs_enable.get() != 0 && _airlink_status.pair_active,
+		_gs_link_input_valid, _gs_link_control.pair_control);
+	if (!active || !_actuator_armed.armed || !_pair_mode_was_selected) {
+		_pair_reference.reset();
+	}
+	_pair_mode_was_selected = selected;
+	if (active) {
+		LqiControllerCore::Input target{};
+		const float throttle = !_actuator_armed.armed ? -1.f
+			: (_pair_gs_active ? _gs_link_control.throttle : _manual_control_setpoint.throttle);
+		reference.enabled = _pair_reference.build(_pair_state.q, _pair_state.angular_velocity,
+			_pair_gs_active ? _gs_link_control.roll : _manual_control_setpoint.roll,
+			_pair_gs_active ? _gs_link_control.pitch : _manual_control_setpoint.pitch,
+			_pair_gs_active ? _gs_link_control.yaw : _manual_control_setpoint.yaw, throttle, target);
+		memcpy(reference.q, target.target_attitude_q_wb, sizeof(reference.q));
+		memcpy(reference.angular_velocity, target.target_angular_velocity_b, sizeof(reference.angular_velocity));
+		reference.collective = target.collective_base;
+	}
+	_pair_reference_pub.publish(reference);
 }
 
 void NNControl::handleFlightPhaseTransitions()
@@ -635,14 +745,11 @@ bool NNControl::buildInput(ControllerInput &input, hrt_abstime now, bool synthet
 
 bool NNControl::airlinkArmingAllowed(hrt_abstime now) const
 {
-	int32_t pair_enabled{0};
-	const param_t handle = param_find("AIRLINK_PAIR_EN");
-
-	if (handle != PARAM_INVALID) {
-		param_get(handle, &pair_enabled);
+	if (_pair_fault_latched) {
+		return false;
 	}
 
-	if (!pair_enabled) {
+	if (_vehicle_status.nav_state != vehicle_status_s::NAVIGATION_STATE_EXTERNAL3) {
 		return true;
 	}
 
@@ -656,7 +763,8 @@ bool NNControl::airlinkArmingAllowed(hrt_abstime now) const
 
 bool NNControl::airlinkControlsOutput(hrt_abstime now) const
 {
-	if (_airlink_status.timestamp == 0 || now < _airlink_status.timestamp
+	if (_vehicle_status.nav_state != vehicle_status_s::NAVIGATION_STATE_EXTERNAL3
+	    || _airlink_status.timestamp == 0 || now < _airlink_status.timestamp
 	    || now - _airlink_status.timestamp > kAirlinkFreshness
 	    || _airlink_status.pair_lost || _airlink_status.pair_reattach_latched) {
 		return false;
@@ -716,6 +824,7 @@ void NNControl::requestLandingDisarm(hrt_abstime now)
 	command.timestamp = now;
 	command.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
 	command.param1 = vehicle_command_s::ARMING_ACTION_DISARM;
+	command.param2 = 21196.f; // Forced local disarm also applies in flight.
 	command.target_system = _vehicle_status.system_id;
 	command.target_component = _vehicle_status.component_id;
 	command.source_system = _vehicle_status.system_id;
@@ -858,20 +967,11 @@ bool NNControl::actuatorAuthorityAllowed(bool landing_fallback)
 	return true;
 }
 
-bool NNControl::validateOutput(const ActuatorSetpoint &output)
+bool NNControl::validateOutput(ActuatorSetpoint &output)
 {
-	for (float value : output.motors) {
-		if (!PX4_ISFINITE(value) || value < 0.f || value > 1.f) {
-			_inhibit_reason = InhibitReason::InvalidOutput;
-			return false;
-		}
-	}
-
-	for (float value : output.servos) {
-		if (!PX4_ISFINITE(value) || value < -1.f || value > 1.f) {
-			_inhibit_reason = InhibitReason::InvalidOutput;
-			return false;
-		}
+	if (!actuator_output_validation::validateAndLimit(output)) {
+		_inhibit_reason = InhibitReason::InvalidOutput;
+		return false;
 	}
 
 	return true;
@@ -1089,27 +1189,75 @@ void NNControl::Run()
 	perf_count(_interval_perf);
 	updateSubscriptions();
 	updateParameters();
+	// Compare timestamps only after copying subscriptions; a concurrent publisher can run after cycle_start.
+	const hrt_abstime now = hrt_absolute_time();
 
 	if (!_actuator_armed.armed) {
 		updateLandingSafetyConfig();
 	}
 
-	updateExternalModeRegistration(cycle_start);
-	updateManualSource(cycle_start);
+	updateExternalModeRegistration(now);
+	updateManualSource(now);
+	updatePairMode(now);
 	handleFlightPhaseTransitions();
-	publishGsLinkStatus(cycle_start);
+	publishGsLinkStatus(now);
 	handleVerificationRequest();
 
 	ControllerInput input{};
 	ActuatorSetpoint output{};
 	bool inference_valid{false};
-	const bool airlink_controls = airlinkControlsOutput(cycle_start);
+	const bool airlink_controls = airlinkControlsOutput(now);
 	const bool airlink_status_fresh = _airlink_status.timestamp != 0
-					  && cycle_start >= _airlink_status.timestamp
-					  && cycle_start - _airlink_status.timestamp <= kAirlinkFreshness;
-	const bool pair_lost_airborne = airlink_status_fresh && _airlink_status.pair_lost
-					&& _airlink_status.local_airborne_latched
-					&& _actuator_armed.armed;
+					  && now >= _airlink_status.timestamp
+					  && now - _airlink_status.timestamp <= kAirlinkFreshness;
+	const bool pair_selected = _vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL3;
+	const bool attitude_fresh = _vehicle_attitude.timestamp_sample != 0
+				    && now >= _vehicle_attitude.timestamp_sample
+				    && now - _vehicle_attitude.timestamp_sample <= kEstimatorTimeout;
+	const bool protect_collective = _backend.coaxialCollectiveActive()
+				       && !airlink_controls && !pair_selected && attitude_fresh;
+	if (_attitude_termination_guard.update(_actuator_armed.armed, protect_collective, _vehicle_attitude.q)) {
+		if (_inhibit_reason != InhibitReason::AttitudeTermination) {
+			PX4_ERR("collective attitude limit 30 deg: output stopped until disarm");
+			_backend.reset();
+		}
+
+		_inhibit_reason = InhibitReason::AttitudeTermination;
+		_single_landing_active = false;
+		requestLandingDisarm(now);
+		publishOutput(nullptr, now);
+		_output_enabled = false;
+		perf_end(_cycle_perf);
+		return;
+	}
+
+	if (airlink_status_fresh && !_actuator_armed.armed
+	    && _airlink_status.operator_disarm_timestamp > _pair_operator_disarm_timestamp) {
+		_pair_operator_disarm_timestamp = _airlink_status.operator_disarm_timestamp;
+		_pair_fault_latched = false;
+		_pair_estimate_guard.acknowledge();
+		_pair_link_seen = false;
+		_pair_gs_gate.update(false, false, false);
+		_pair_reference.reset();
+	}
+	if (airlink_status_fresh && _airlink_status.link_state >= airlink_status_s::STATE_READY) {
+		_pair_link_seen = true;
+	}
+	if (_airlink_status.role == airlink_status_s::ROLE_MASTER) {
+		const bool protected_pair = _actuator_armed.armed && (pair_selected || _airlink_status.pair_active);
+		_pair_fault_latched |= _pair_estimate_guard.update(protected_pair, _pair_state, hrt_absolute_time());
+	}
+	_pair_fault_latched |= _airlink_status.pair_lost || _airlink_status.pair_reattach_latched
+		|| (_pair_link_seen && !airlink_status_fresh);
+	if (_pair_fault_latched) {
+		_inhibit_reason = InhibitReason::ActuatorLockdown;
+		_single_landing_active = false;
+		requestLandingDisarm(now);
+		publishOutput(nullptr, now);
+		_output_enabled = false;
+		perf_end(_cycle_perf);
+		return;
+	}
 
 	if (airlink_controls) {
 		if (!_airlink_output_owned) {
@@ -1121,53 +1269,13 @@ void NNControl::Run()
 		_single_landing_active = false;
 		_landing_guard.reset();
 		_landing_disarm_requested = false;
-		inference_valid = buildAirlinkOutput(output, cycle_start);
+		inference_valid = buildAirlinkOutput(output, now);
 
 	} else {
 		_airlink_output_owned = false;
-		bool use_synthetic_landing = false;
-
-		if (pair_lost_airborne || _single_landing_active) {
-			const bool gs_recovered = !_landing_disarm_requested
-						  && _gs_link_input_valid
-						  && _ground_station_gate.source()
-						  == GroundStationGate::Source::GroundStation;
-
-			if (gs_recovered) {
-				if (_single_landing_active) {
-					PX4_INFO("SINGLE_LANDING exit: GS-LINK recovered");
-				}
-
-				_single_landing_active = false;
-				_landing_guard.reset();
-				_landing_disarm_requested = false;
-
-			} else {
-				if (!_single_landing_active) {
-					_single_landing_active = true;
-					_landing_guard.start(cycle_start);
-					_landing_disarm_requested = false;
-					_backend.reset();
-					_last_input_valid = false;
-					_last_sample_timestamp = 0;
-					PX4_WARN("AIRLINK lost in flight: entering SINGLE_LANDING, collective 0.25");
-				}
-
-				if (checkSingleLanding(cycle_start)) {
-					inference_valid = false;
-					_inhibit_reason = InhibitReason::SingleLanding;
-
-				} else {
-					use_synthetic_landing = true;
-				}
-			}
-		}
-
-		if (use_synthetic_landing) {
-			inference_valid = buildInput(input, cycle_start, true);
-
-		} else if (!_single_landing_active) {
-			inference_valid = buildInput(input, cycle_start);
+		// Never run C_SINGLE while the pilot selected the composite mode.
+		if (!pair_selected) {
+			inference_valid = buildInput(input, now);
 		}
 
 		if (!inference_valid && _last_input_valid) {
@@ -1226,7 +1334,7 @@ void NNControl::Run()
 
 	if (actuator_output_allowed) {
 		_inhibit_reason = InhibitReason::None;
-		publishOutput(&output, cycle_start);
+		publishOutput(&output, now);
 		_output_enabled = true;
 
 	} else {
@@ -1243,7 +1351,7 @@ void NNControl::Run()
 		// valid control frame. Disarmed operation still publishes a fresh null
 		// frame so the startup handshake can observe the unarmed state.
 		if (!hold_hil_timestamp) {
-			publishOutput(nullptr, cycle_start);
+			publishOutput(nullptr, now);
 		}
 		_output_enabled = false;
 	}
@@ -1283,6 +1391,7 @@ const char *NNControl::reasonString(InhibitReason reason)
 	case InhibitReason::AirframeMismatch: return "identified model airframe mismatch";
 	case InhibitReason::AirlinkCommandStale: return "AIRLINK command missing/stale";
 	case InhibitReason::SingleLanding: return "SINGLE_LANDING termination";
+	case InhibitReason::AttitudeTermination: return "30 deg attitude termination (latched)";
 	}
 
 	return "unknown";

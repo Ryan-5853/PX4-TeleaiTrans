@@ -6,16 +6,17 @@ parameters:
       description:
         short: External vision (EV) sensor aiding
         long: 'Set bits in the following positions to enable: 0 : Horizontal position
-          fusion 1 : Vertical position fusion 2 : 3D velocity fusion 3 : Yaw'
+          fusion 1 : Vertical position fusion 2 : 3D velocity fusion 3 : Yaw 4 : Full attitude (supersedes yaw)'
       type: bitmask
       bit:
         0: Horizontal position
         1: Vertical position
         2: 3D velocity
         3: Yaw
+        4: Full attitude
       default: 0
       min: 0
-      max: 15
+      max: 31
     EKF2_EV_DELAY:
       description:
         short: Vision Position Estimator delay relative to IMU measurements

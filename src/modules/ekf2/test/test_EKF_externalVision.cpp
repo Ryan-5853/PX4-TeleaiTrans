@@ -355,3 +355,94 @@ TEST_F(EkfExternalVisionTest, positionFrameLocal)
 	EXPECT_NEAR(pos_earth_est(0), pos_earth(0), 0.1f);
 	EXPECT_NEAR(pos_earth_est(1), pos_earth(1), 0.1f);
 }
+
+TEST_F(EkfExternalVisionTest, fullAttitudeOrientationOnlyFusion)
+{
+	_sensor_simulator.runSeconds(_tilt_align_time);
+	auto params = _ekf->getParamHandle();
+	params->ev_ctrl = static_cast<int32_t>(EvCtrl::ATTITUDE) | static_cast<int32_t>(EvCtrl::YAW);
+	params->mag_fusion_type = 5; // no competing magnetic heading
+	params->ev_att_noise = 0.05f;
+	// Deliberately misalign the inertial estimate by changing the actual attitude
+	// after initial tilt alignment. Only attitude observations are available.
+	const Quatf truth(matrix::Eulerf(0.10f, -0.08f, 0.35f));
+	_sensor_simulator.simulateOrientation(truth);
+	extVisionSample sample{};
+	sample.pos.setNaN();
+	sample.vel.setNaN();
+	sample.quat = truth;
+	sample.orientation_var = Vector3f(0.0025f, 0.0025f, 0.0025f);
+	sample.pos_frame = PositionFrame::LOCAL_FRAME_FRD;
+	sample.vel_frame = VelocityFrame::LOCAL_FRAME_FRD;
+	sample.quality = 100;
+	_sensor_simulator._vio.setData(sample);
+	_sensor_simulator.startExternalVision();
+	_sensor_simulator.runSeconds(10.f);
+	EXPECT_TRUE(_ekf->aid_src_ev_att().fused);
+	EXPECT_EQ(_ekf->aid_src_ev_yaw().time_last_fuse, 0u); // no double yaw update
+	const Vector3f error = matrix::AxisAnglef(_ekf->getQuaternion() * truth.inversed());
+	EXPECT_LT(error.norm(), 0.03f);
+
+	// A marker flip must not drag the estimate or trigger an in-flight reset.
+	_ekf->set_in_air_status(true);
+	_ekf->set_vehicle_at_rest(false);
+	sample.quat = Quatf(matrix::Eulerf(2.f, 0.f, 0.f));
+	_sensor_simulator._vio.setData(sample);
+	_sensor_simulator.runSeconds(0.15f);
+	EXPECT_TRUE(_ekf->aid_src_ev_att().innovation_rejected);
+	EXPECT_FALSE(_ekf->aid_src_ev_att().fused);
+	EXPECT_LT(Vector3f(matrix::AxisAnglef(_ekf->getQuaternion() * truth.inversed())).norm(), 0.04f);
+
+	sample.quat = -truth; // q and -q represent the same attitude
+	_sensor_simulator._vio.setData(sample);
+	_sensor_simulator.runSeconds(1.f);
+	EXPECT_TRUE(_ekf->aid_src_ev_att().fused);
+
+	_sensor_simulator.stopExternalVision();
+	_sensor_simulator.runSeconds(1.f);
+	EXPECT_FALSE(_ekf->control_status_flags().ev_yaw);
+	EXPECT_FALSE(_ekf->aid_src_ev_att().fused);
+}
+
+TEST(EkfExternalVisionHighRateTest, fullAttitude100HzWithDelay)
+{
+	auto _ekf = std::make_shared<Ekf>();
+	SensorSimulator _sensor_simulator(_ekf);
+	// Timing settings must precede init(), which allocates the buffers.
+	auto params = _ekf->getParamHandle();
+	params->filter_update_interval_us = 5000;
+	params->delay_max_ms = 200.f;
+	params->ev_delay_ms = 10.f;
+	params->ev_ctrl = static_cast<int32_t>(EvCtrl::ATTITUDE);
+	params->mag_fusion_type = 5;
+	_ekf->init(0);
+	_ekf->set_in_air_status(false);
+	_ekf->set_vehicle_at_rest(true);
+	_sensor_simulator.runSeconds(7.f);
+	extVisionSample sample{};
+	sample.quat = Quatf();
+	sample.pos.setNaN();
+	sample.vel.setNaN();
+	sample.orientation_var = Vector3f(0.0025f, 0.0025f, 0.0025f);
+	sample.pos_frame = PositionFrame::LOCAL_FRAME_FRD;
+	sample.vel_frame = VelocityFrame::LOCAL_FRAME_FRD;
+	sample.quality = 100;
+	_sensor_simulator._vio.setData(sample);
+	_sensor_simulator._vio.setRateHz(100);
+	_sensor_simulator.startExternalVision();
+	_sensor_simulator.runSeconds(2.f);
+	uint64_t previous = _ekf->aid_src_ev_att().timestamp_sample;
+	int updates = 0;
+
+	for (int i = 0; i < 1000; ++i) {
+		_sensor_simulator.runMicroseconds(1000);
+		const uint64_t current = _ekf->aid_src_ev_att().timestamp_sample;
+
+		if (current != previous) { ++updates; previous = current; }
+	}
+
+	EXPECT_GE(updates, 95);
+	EXPECT_LE(updates, 101);
+	EXPECT_TRUE(_ekf->aid_src_ev_att().fused);
+	EXPECT_FALSE(_ekf->aid_src_ev_att().innovation_rejected);
+}

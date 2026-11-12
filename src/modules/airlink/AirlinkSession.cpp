@@ -68,9 +68,10 @@ void Session::start(Role role, uint32_t session_id, const LocalStatus &local, ui
 	_role = role == Role::Disabled ? Role::Disabled : role;
 	_session_id = session_id == 0 ? 1 : session_id;
 	_local = local;
-	_pair_reattach_latched = local.pair_reattach_latched;
+	_pair_reattach_latched = _pair_reattach_latched || local.pair_reattach_latched;
 	_emergency_latched = false;
 	_peer_session = 0;
+	_timing.session(0);
 	_remote = {};
 	_peer_command = {};
 	_peer_sensor = {};
@@ -125,6 +126,19 @@ void Session::set_local_status(const LocalStatus &local)
 {
 	_local = local;
 	_local.pair_reattach_latched = _pair_reattach_latched;
+}
+
+bool Session::reset_after_operator_disarm(uint64_t now_us)
+{
+	if (_local.armed) { return false; }
+	LocalStatus local = _local;
+	local.pair_reattach_latched = false;
+	local.airborne_latched = false;
+	_pair_reattach_latched = false;
+	_ever_ready = false;
+	_peer_inbound_stale_since = 0;
+	start(_role, _session_id + 1, local, now_us);
+	return true;
 }
 
 void Session::set_armed(bool armed)
@@ -332,7 +346,7 @@ uint16_t Session::local_health_flags(uint64_t now_us) const
 uint32_t Session::local_capabilities() const
 {
 	return Single | Pair | PairArmCapability | GsPosition | SingleLanding
-	       | LinkTest | SensorStateV1 | Output2M3s | CompositeYawReference;
+	       | LinkTest | SensorStateV1 | Output2M3s | CompositeYawReference | RuntimeTiming | EstimatorKill;
 }
 
 uint32_t Session::local_handshake_flags() const
@@ -427,7 +441,8 @@ void Session::queue_periodic_heartbeat(uint64_t now_us)
 
 void Session::start_handshake(uint64_t now_us)
 {
-	if (_role != Role::Master || _peer_session == 0 || _handshake.active
+	if (_pair_reattach_latched || _remote.pair_reattach_latched
+	    || _role != Role::Master || _peer_session == 0 || _handshake.active
 	    || _state == LinkState::PairActive || _state == LinkState::PairArmedGround) {
 		return;
 	}
@@ -620,19 +635,14 @@ void Session::clear_control(bool disarm, ReasonCode reason, bool mark_reattach,
 
 void Session::enter_link_down(SessionActions &actions, ReasonCode reason)
 {
-	const bool was_pair_transaction = _state == LinkState::PairActive
-					  || _state == LinkState::PairArmedGround
-					  || _state == LinkState::PairArmPending;
-	const bool was_pair_active = _state == LinkState::PairActive
-				     || _state == LinkState::PairArmedGround;
-	clear_control(_local.armed && !_local.airborne_latched && was_pair_transaction,
-		      reason, was_pair_active, actions);
+	const bool lost = _ever_ready;
+	clear_control(lost, reason, lost, actions);
 	_state = LinkState::Down;
 	_peer_session = 0;
 	_remote = {};
 	_handshake = {};
 	_pending = {};
-	actions.pair_lost = was_pair_active;
+	actions.pair_lost = lost;
 }
 
 void Session::expire_pending(uint64_t now_us, SessionActions &actions)
@@ -681,7 +691,7 @@ void Session::expire_pending(uint64_t now_us, SessionActions &actions)
 		_link_test.pending_abort = false;
 		finish_link_test(now_us, actions);
 
-	} else {
+	} else if (!_pair_reattach_latched) {
 		_state = LinkState::Ready;
 	}
 }
@@ -1034,7 +1044,6 @@ bool Session::request_pair_arm(uint64_t now_us)
 {
 	if (_role != Role::Master || _state != LinkState::PairControlReady || _pending.active
 	    || _control_enable_acked_us == 0 || now_us < _control_enable_acked_us
-	    || now_us - _control_enable_acked_us > kSensorFreshTimeoutUs
 	    || _pair_reattach_latched || _emergency_latched
 	    || _local.armed || _local.airborne_latched || !_local.pair_mode_selected
 	    || !_local.local_rc_valid || !_local.safety_gate_allow || !peer_is_fresh(now_us)
@@ -1117,9 +1126,12 @@ bool Session::request_event(MessageId message_id, ReasonCode reason, uint64_t no
 
 bool Session::request_pair_disarm(ReasonCode reason, uint64_t now_us)
 {
+	_pending = {}; // Disarm cancels any outstanding arm/enable transaction.
 	SessionActions ignored{};
 	clear_control(true, reason, false, ignored);
-	_state = LinkState::Ready;
+	if (_ever_ready) {
+		_state = LinkState::Ready;
+	}
 	return request_event(MessageId::PairDisarm, reason, now_us);
 }
 
@@ -1131,10 +1143,24 @@ bool Session::request_control_release(ReasonCode reason, uint64_t now_us)
 	return request_event(MessageId::ControlRelease, reason, now_us);
 }
 
+SessionActions Session::fail_estimator(uint64_t now_us)
+{
+	SessionActions actions{};
+	// Safety transaction preempts ARM/ENABLE retries and any queued actuator packet.
+	_pending = {};
+	_tx_head = _tx_count = 0;
+	clear_control(true, ReasonCode::EstimatorInvalid, true, actions);
+	_emergency_latched = true;
+	_state = LinkState::PairLost;
+	actions.pair_lost = true;
+	(void)request_event(MessageId::EmergencyWithdraw, ReasonCode::EstimatorInvalid, now_us);
+	return actions;
+}
+
 bool Session::request_emergency_withdraw(ReasonCode reason, uint64_t now_us)
 {
 	SessionActions ignored{};
-	clear_control(_local.armed && !_local.airborne_latched, reason, false, ignored);
+	clear_control(_local.armed, reason, false, ignored);
 	_emergency_latched = true;
 	_state = LinkState::Discovered;
 	return request_event(MessageId::EmergencyWithdraw, reason, now_us);
@@ -1181,6 +1207,21 @@ bool Session::notify_local_arm_result(bool success, uint64_t now_us)
 	}
 
 	return false;
+}
+
+void Session::queue_timing_probe(uint64_t now_us)
+{
+	_timing.session(_peer_session);
+	_timing.expire(now_us);
+	if (!_peer_session || !_ever_ready || _state == LinkState::Down
+	    || _state == LinkState::Discovered || _state == LinkState::PairLost
+	    || _link_test.active || !_timing.due(now_us)) return;
+	uint8_t payload[8] {};
+	write_u32(payload, static_cast<uint32_t>(now_us));
+	write_u32(payload + 4, static_cast<uint32_t>(now_us >> 32));
+	if (queue_frame(FrameType::Data, static_cast<uint8_t>(MessageId::LinkTiming), 0, payload, sizeof(payload))) {
+		_timing.sent(now_us);
+	}
 }
 
 bool Session::queue_sensor_state(const SensorState &sensor, uint64_t now_us)
@@ -1306,6 +1347,7 @@ void Session::handle_ack(const Ack &ack, SessionActions &actions, uint64_t now_u
 	if (completed_message == static_cast<uint8_t>(MessageId::LinkHandshake)) {
 		if (result == AckResult::Success) {
 			_state = LinkState::Ready;
+			_ever_ready = true;
 			_handshake = {};
 			_emergency_latched = false;
 
@@ -1377,7 +1419,9 @@ void Session::handle_ack(const Ack &ack, SessionActions &actions, uint64_t now_u
 
 	if (completed_message == static_cast<uint8_t>(MessageId::ControlRelease)
 	    || completed_message == static_cast<uint8_t>(MessageId::PairDisarm)) {
-		_state = LinkState::Ready;
+		if (_ever_ready) {
+			_state = LinkState::Ready;
+		}
 		return;
 	}
 
@@ -1465,10 +1509,12 @@ void Session::handle_reliable_event(const Frame &frame, const ReliableEvent &eve
 		}
 
 	case MessageId::EmergencyWithdraw: {
-			clear_control(_local.armed && !_local.airborne_latched, event.reason_code,
-				      false, actions);
+			const bool estimator_kill = event.reason_code == ReasonCode::EstimatorInvalid;
+			if (estimator_kill) { _pending = {}; _tx_head = _tx_count = 0; }
+			clear_control(_local.armed, event.reason_code, estimator_kill, actions);
 			_emergency_latched = true;
-			_state = LinkState::Discovered;
+			_state = estimator_kill ? LinkState::PairLost : LinkState::Discovered;
+			actions.pair_lost |= estimator_kill;
 			cache_event(frame, event, AckResult::Success, 0, now_us);
 			send_ack(frame, AckResult::Success);
 			return;
@@ -1486,7 +1532,6 @@ void Session::handle_reliable_event(const Frame &frame, const ReliableEvent &eve
 				   || _emergency_latched || _local.armed || _local.airborne_latched
 				   || _pair_control_ready_us == 0
 				   || now_us < _pair_control_ready_us
-				   || now_us - _pair_control_ready_us > kSensorFreshTimeoutUs
 				   || !_local.pair_mode_selected || !_local.local_rc_valid
 				   || !_local.safety_gate_allow
 				   || (_remote.health_flags & Armed) != 0
@@ -1513,14 +1558,11 @@ void Session::handle_reliable_event(const Frame &frame, const ReliableEvent &eve
 		}
 
 	case MessageId::PairDisarm: {
-			if (_role != Role::Slave || frame.header.source_role != Role::Master) {
-				cache_event(frame, event, AckResult::InvalidState, 0, now_us);
-				send_ack(frame, AckResult::InvalidState);
-				return;
-			}
-
+			_pending = {};
 			clear_control(true, event.reason_code, false, actions);
-			_state = LinkState::Ready;
+			if (_ever_ready) {
+				_state = LinkState::Ready;
+			}
 			cache_event(frame, event, AckResult::Success, 0, now_us);
 			send_ack(frame, AckResult::Success);
 			return;
@@ -1559,6 +1601,11 @@ SessionActions Session::receive(const Frame &frame, uint64_t now_us)
 		_remote.session = frame.header.source_session;
 		_remote.health_flags = heartbeat.health_flags;
 		_remote.inbound_periodic_fresh = (heartbeat.health_flags & InboundPeriodicFresh) != 0;
+		if (_remote.inbound_periodic_fresh) {
+			_peer_inbound_stale_since = 0;
+		} else if (_peer_inbound_stale_since == 0) {
+			_peer_inbound_stale_since = now_us;
+		}
 		_remote.local_rc_valid = (heartbeat.health_flags & HealthLocalRcValid) != 0;
 		_remote.safety_gate_allow = (heartbeat.health_flags & HealthSafetyGateAllow) != 0;
 		_remote.airlink_control_active =
@@ -1574,14 +1621,9 @@ SessionActions Session::receive(const Frame &frame, uint64_t now_us)
 				finish_link_test(now_us, actions);
 			}
 
-			const bool was_pair_transaction = _state == LinkState::PairActive
-							  || _state == LinkState::PairArmedGround
-							  || _state == LinkState::PairArmPending;
-			const bool was_pair_active = _state == LinkState::PairActive
-						     || _state == LinkState::PairArmedGround;
-			clear_control(_local.armed && !_local.airborne_latched
-				      && was_pair_transaction,
-				      ReasonCode::SessionChanged, was_pair_active, actions);
+			const bool was_pair_active = _ever_ready;
+			clear_control(was_pair_active, ReasonCode::SessionChanged, was_pair_active, actions);
+			_peer_inbound_stale_since = 0; // A new session cannot inherit the old peer stream timeout.
 			_peer_session = frame.header.source_session;
 			_state = LinkState::Discovered;
 			_handshake = {};
@@ -1597,6 +1639,11 @@ SessionActions Session::receive(const Frame &frame, uint64_t now_us)
 			}
 		}
 
+		if (_ever_ready && _remote.pair_reattach_latched) {
+			enter_link_down(actions, ReasonCode::PeerStreamStale);
+			return actions;
+		}
+
 		if (_role == Role::Master && _state == LinkState::Discovered
 		    && now_us >= _handshake_retry_after_us) {
 			start_handshake(now_us);
@@ -1607,6 +1654,19 @@ SessionActions Session::receive(const Frame &frame, uint64_t now_us)
 
 	if (_peer_session == 0 || frame.header.source_session != _peer_session) {
 		++_session_errors;
+		return actions;
+	}
+
+	if (frame.header.frame_type == FrameType::Data && message_id == MessageId::LinkTiming) {
+		_timing.session(_peer_session);
+		if (frame.header.payload_len != 8 || (frame.header.flags != 0 && frame.header.flags != Response)) return actions;
+		++_rx_frames;
+		if (frame.header.flags == Response) {
+			const uint64_t token = read_u32(frame.payload) | (uint64_t(read_u32(frame.payload + 4)) << 32);
+			_timing.reply(token, now_us);
+		} else {
+			queue_frame(FrameType::Data, static_cast<uint8_t>(MessageId::LinkTiming), Response, frame.payload, 8);
+		}
 		return actions;
 	}
 
@@ -1825,6 +1885,7 @@ SessionActions Session::receive(const Frame &frame, uint64_t now_us)
 					_pending = {};
 					_completed_handshake_transaction = handshake.transaction_id;
 					_state = LinkState::Ready;
+					_ever_ready = true;
 					_emergency_latched = false;
 				}
 
@@ -2014,27 +2075,29 @@ SessionActions Session::tick(uint64_t now_us)
 
 	_local.pair_reattach_latched = _pair_reattach_latched;
 	expire_pending(now_us, actions);
+	if (_ever_ready && _peer_inbound_stale_since != 0
+	    && now_us - _peer_inbound_stale_since > kSensorFreshTimeoutUs) {
+		enter_link_down(actions, ReasonCode::PeerStreamStale);
+	}
 
 	if (_peer_session != 0 && _state >= LinkState::Discovered
-	    && _state != LinkState::PairActive && !_link_test.active
-	    && !_link_test.pending_start && !_link_test.pending_abort) {
-		if (_last_peer_heartbeat_us == 0 || now_us < _last_peer_heartbeat_us
-		    || now_us - _last_peer_heartbeat_us > kPeerHeartbeatTimeoutUs) {
+	    && _state != LinkState::PairActive) {
+		if (_last_peer_frame_us == 0 || now_us < _last_peer_frame_us
+		    || now_us - _last_peer_frame_us > (_ever_ready ? kSensorFreshTimeoutUs : kPeerHeartbeatTimeoutUs)) {
 			enter_link_down(actions, ReasonCode::HeartbeatTimeout);
 		}
 	}
 
-	if (_state == LinkState::PairControlReady && _role == Role::Slave
-	    && _pair_control_ready_us != 0 && now_us >= _pair_control_ready_us
-	    && now_us - _pair_control_ready_us > kSensorFreshTimeoutUs) {
+	// Authorization belongs to the live session, not to the age of its ACK.
+	// The 10 ms deadline applies to periodic data, not time spent waiting for RC ARM.
+	const uint16_t standby_health = HealthLocalRcValid | HealthSafetyGateAllow | PairModeSelected;
+	if (_state == LinkState::PairControlReady
+	    && (!_local.local_ready || !_local.pair_mode_selected || !_local.local_rc_valid
+		|| !_local.safety_gate_allow || _pair_reattach_latched || _emergency_latched
+		|| (_remote.health_flags & standby_health) != standby_health)) {
 		_state = LinkState::Ready;
 		_control_enable_acked_us = 0;
-
-	} else if (_state == LinkState::PairControlReady && _role == Role::Master
-		   && _pair_control_ready_us != 0 && now_us >= _pair_control_ready_us
-		   && now_us - _pair_control_ready_us > kSensorFreshTimeoutUs) {
-		_state = LinkState::Ready;
-		_control_enable_acked_us = 0;
+		_pair_control_ready_us = 0;
 	}
 
 	const bool control_transaction = _state == LinkState::PairActive
@@ -2042,8 +2105,8 @@ SessionActions Session::tick(uint64_t now_us)
 					 || _state == LinkState::PairArmPending;
 
 	if (control_transaction && (!_local.local_rc_valid || !_local.safety_gate_allow)) {
-		clear_control(_local.armed && !_local.airborne_latched,
-			      ReasonCode::LocalRcOrSafety, false, actions);
+		clear_control(_local.armed,
+			      ReasonCode::LocalRcOrSafety, true, actions);
 		_state = LinkState::PairLost;
 		actions.pair_lost = true;
 	}
@@ -2074,7 +2137,7 @@ SessionActions Session::tick(uint64_t now_us)
 	}
 
 	if (critical_stream_stale) {
-		clear_control(_local.armed && !_local.airborne_latched,
+		clear_control(_local.armed,
 			      _role == Role::Master ? ReasonCode::SensorStale : ReasonCode::ControlStale,
 			      true, actions);
 		_state = LinkState::PairLost;

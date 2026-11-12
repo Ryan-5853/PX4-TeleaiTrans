@@ -21,11 +21,11 @@
 PARAM_DEFINE_INT32(AIRLINK_ROLE, 0);
 
 /**
- * Select the paired-controller mode
+ * Legacy paired-controller selection (reserved)
  *
- * Enables use of the paired controller command topic and requires an explicit
- * AIRLINK handshake, CONTROL_ENABLE and PAIR_ARM sequence before paired arming.
- * It does not itself arm either aircraft.
+ * Retained for parameter compatibility. Ground paired flight is selected solely
+ * by External Mode 3 with a configured AIRLINK_ROLE. This parameter no longer
+ * selects the controller or grants arming authority.
  *
  * @boolean
  * @reboot_required false

@@ -7,6 +7,7 @@
 #pragma once
 
 #include "AirlinkProtocol.hpp"
+#include "AirlinkHealth.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -100,6 +101,7 @@ public:
 	void start(Role role, uint32_t session_id, const LocalStatus &local, uint64_t now_us);
 	void set_local_status(const LocalStatus &local);
 	void set_armed(bool armed);
+	bool reset_after_operator_disarm(uint64_t now_us);
 	bool set_role(Role role, uint32_t new_session_id, const LocalStatus &local, uint64_t now_us);
 
 	LinkState state() const { return _state; }
@@ -121,6 +123,8 @@ public:
 	bool pop_tx(Frame &frame);
 	size_t tx_queue_size() const { return _tx_count; }
 
+	const TimingHealth &timing_health() const { return _timing; }
+	void queue_timing_probe(uint64_t now_us);
 	bool queue_sensor_state(const SensorState &sensor, uint64_t now_us);
 	bool queue_yaw_reference(const YawReference &reference, uint64_t now_us);
 	bool query_control_tx_allowed(uint64_t now_us) const;
@@ -129,6 +133,7 @@ public:
 	bool request_pair_arm(uint64_t now_us);
 	bool request_pair_disarm(ReasonCode reason, uint64_t now_us);
 	bool request_control_release(ReasonCode reason, uint64_t now_us);
+	SessionActions fail_estimator(uint64_t now_us);
 	bool request_emergency_withdraw(ReasonCode reason, uint64_t now_us);
 	bool notify_local_arm_result(bool success, uint64_t now_us);
 
@@ -160,7 +165,7 @@ private:
 	static constexpr uint64_t kDuplicateRetentionUs{60'000'000};
 	static constexpr uint32_t kRequiredCapabilities{Single | Pair | PairArmCapability | GsPosition
 			| SingleLanding | LinkTest | SensorStateV1 | Output2M3s
-			| CompositeYawReference};
+			| CompositeYawReference | RuntimeTiming | EstimatorKill};
 
 	struct PendingTemplate {
 		bool active{false};
@@ -257,6 +262,8 @@ private:
 	ActuatorCommand _peer_command{};
 	SensorState _peer_sensor{};
 	bool _pair_reattach_latched{false};
+	bool _ever_ready{false};
+	uint64_t _peer_inbound_stale_since{0};
 	bool _emergency_latched{false};
 	bool _master_arm_pending{false};
 	bool _slave_arm_pending{false};
@@ -298,6 +305,7 @@ private:
 	PendingTemplate _handshake{};
 	DuplicateEntry _duplicates[kDuplicateCacheSize] {};
 	LinkTestState _link_test{};
+	TimingHealth _timing{};
 };
 
 const char *link_state_name(LinkState state);

@@ -13,13 +13,13 @@
  *
  * The pilot throttle requests a vertical acceleration. A z-acceleration PI
  * controls the coaxial common mode. The 8-state attitude LQI produces three
- * desired moments. Motor differential alone realizes yaw, and all three
- * servos realize the roll/pitch moments while cancelling their local common
- * thrust and yaw components.
+ * desired moments. The legacy allocator uses motor differential for yaw and
+ * servos for roll/pitch. An optional deployment envelope adds bounded grid
+ * common-mode yaw trim, near-equal predicted rotor speeds, and anti-windup.
  */
 struct LqiCoaxialCollectiveModel
 {
-	static constexpr uint32_t kSchemaVersion{3};
+	static constexpr uint32_t kSchemaVersion{5};
 	static constexpr int kStateSize{8};
 	static constexpr int kAttitudeInputSize{3};
 	static constexpr int kOutputSize{5};
@@ -31,7 +31,9 @@ struct LqiCoaxialCollectiveModel
 	enum class BodyFrame : uint8_t { FRD = 1 };
 	enum class QuaternionConvention : uint8_t { HamiltonWxyzBodyToWorld = 1 };
 	enum class CollectiveContract : uint8_t {
-		PilotAccelerationDualMotorCommonDifferentialServoRollPitch = 2
+		PilotAccelerationDualMotorCommonDifferentialServoRollPitch = 2,
+		PilotAccelerationBoundedRotorDifferentialGridYawTrim = 3,
+		PilotAccelerationSharedYawAntiWindup = 4
 	};
 
 	uint32_t schema_version;
@@ -90,4 +92,21 @@ struct LqiCoaxialCollectiveModel
 
 	uint32_t weight_bytes;
 	uint32_t checksum;
+
+	// Optional deployment envelope. Null preserves the legacy allocation.
+	// Commands are PRE x0.5 map; ratios constrain model-predicted steady RPM,
+	// not measured ESC speed. The lower torque scale is an experimental model
+	// correction, not a newly identified aerodynamic coefficient.
+	enum YawBalanceIndex {
+		TrimSpeedRatio, MaximumSpeedRatio, MotorCommandMaximum,
+		GridCommonCommand, GridYawPerThrustPerCommand,
+		YawIntegralMomentLimit, LowerTorqueScale, YawBalanceSize
+	};
+	const float *yaw_balance{nullptr};
+
+	// Contract 4: reserve P/D authority by limiting each roll/pitch integral
+	// moment to a fraction of that axis's moment cap. Preferred grid common
+	// is a fraction of the existing signed maximum and may move within [max,0].
+	float roll_pitch_integral_moment_fraction{1.0f};
+	float grid_common_preference_fraction{1.0f};
 };

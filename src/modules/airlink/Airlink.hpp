@@ -8,6 +8,7 @@
 
 #include "AirlinkSession.hpp"
 #include "AirlinkImu.hpp"
+#include "MaintainedArmSwitch.hpp"
 
 #include <drivers/drv_hrt.h>
 #include <lib/systemlib/mavlink_log.h>
@@ -24,8 +25,11 @@
 #include <uORB/topics/action_request.h>
 #include <uORB/topics/airlink_actuator_command.h>
 #include <uORB/topics/airlink_pair_command.h>
+#include <uORB/topics/composite_attitude_estimate.h>
+#include "PairEstimateSafety.hpp"
 #include <uORB/topics/airlink_sensor_state.h>
 #include <uORB/topics/airlink_status.h>
+#include <uORB/topics/airlink_health.h>
 #include <uORB/topics/airlink_test_result.h>
 #include <uORB/topics/airlink_yaw_reference.h>
 #include <uORB/topics/battery_status.h>
@@ -33,6 +37,7 @@
 #include <uORB/topics/failsafe_flags.h>
 #include <uORB/topics/gs_link_status.h>
 #include <uORB/topics/input_rc.h>
+#include <uORB/topics/manual_control_switches.h>
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
@@ -86,6 +91,7 @@ private:
 	void handleExternalArming(uint64_t now_us);
 	void applyRequestedRole();
 	void applyRequestedPairMode();
+	void applyMaintainedArmSwitchConfig();
 	void initializeSession(uint64_t now_us);
 	uint32_t generateSessionId(uint64_t now_us);
 	uint32_t computeConfigCrc32c();
@@ -112,6 +118,7 @@ private:
 	void publishPeerYaw(const airlink::Frame &frame, const airlink::YawReference &reference,
 			    uint64_t now_us);
 	void finishSensorTest(uint64_t now_us);
+	void checkEstimateKill(uint64_t now_us, airlink::SessionActions &actions);
 	bool pairCommandValid(const airlink_pair_command_s &command, uint64_t now_us) const;
 	airlink::ActuatorCommand toActuatorCommand(const float motors[2], const float servos[3]) const;
 
@@ -145,18 +152,21 @@ private:
 	uORB::Subscription _failsafe_flags_sub{ORB_ID(failsafe_flags)};
 	uORB::Subscription _gs_link_status_sub{ORB_ID(gs_link_status)};
 	uORB::Subscription _input_rc_sub{ORB_ID(input_rc)};
+	uORB::Subscription _manual_switches_sub{ORB_ID(manual_control_switches)};
 	airlink::ImuSource _imu_source{};
 	uORB::Subscription _vehicle_angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
 	uORB::Subscription _vehicle_command_ack_sub{ORB_ID(vehicle_command_ack)};
 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
+	uORB::Subscription _estimate_sub{ORB_ID(composite_attitude_estimate)};
 	uORB::Subscription _pair_command_sub{ORB_ID(airlink_pair_command)};
 	uORB::Subscription _yaw_reference_sub{ORB_ID(composite_yaw_reference)};
 
 	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
 	uORB::Publication<airlink_actuator_command_s>
 	_actuator_command_pub{ORB_ID(airlink_actuator_command)};
+	uORB::Publication<airlink_health_s> _health_pub{ORB_ID(airlink_health)};
 	uORB::Publication<airlink_status_s> _status_pub{ORB_ID(airlink_status)};
 	uORB::Publication<airlink_test_result_s> _test_result_pub{ORB_ID(airlink_test_result)};
 	uORB::Publication<airlink_sensor_state_s> _sensor_state_pub{ORB_ID(airlink_sensor_state)};
@@ -164,6 +174,11 @@ private:
 
 	actuator_armed_s _actuator_armed{};
 	action_request_s _action_request{};
+	manual_control_switches_s _manual_switches{};
+	airlink::MaintainedArmSwitch _maintained_arm_switch{};
+	bool _arm_switch_mapped{false};
+	bool _arm_switch_allowed{false};
+	bool _arm_switch_off{false};
 	battery_status_s _battery_status{};
 	esc_status_s _esc_status{};
 	failsafe_flags_s _failsafe_flags{};
@@ -175,6 +190,8 @@ private:
 	vehicle_command_ack_s _vehicle_command_ack{};
 	vehicle_command_s _vehicle_command{};
 	airlink_pair_command_s _pair_command{};
+	composite_attitude_estimate_s _estimate{};
+	pair_estimate_safety::Guard _estimate_guard{};
 	composite_yaw_reference_s _yaw_reference{};
 
 	px4::atomic<uint32_t> _commands{0};
@@ -183,6 +200,8 @@ private:
 	uint16_t _requested_test_duration_ms{5000};
 	uint16_t _requested_sensor_test_duration_ms{5000};
 
+	airlink::RuntimeHealth _health{};
+	uint32_t _health_peer_session{0};
 	uint64_t _last_received_control_us{0};
 	uint16_t _last_received_control_sequence{0};
 	uint32_t _last_received_control_session{0};
@@ -221,6 +240,8 @@ private:
 	bool _pair_lost_latched{false};
 	bool _follower_control_published{false};
 	bool _operator_arm_requested{false};
+	bool _operator_disarm_pending{false};
+	uint64_t _operator_disarm_timestamp{0};
 	bool _sensor_test_active{false};
 
 	DEFINE_PARAMETERS(

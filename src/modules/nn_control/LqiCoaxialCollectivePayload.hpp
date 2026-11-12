@@ -165,7 +165,17 @@ static constexpr float kLowerTable[20] = {
 static constexpr float kManualCommandDecay[3] = {
 	0.0f,
 	0.0f,
-	0.0f,
+	0.990049899f,
+};
+
+static constexpr float kYawBalance[7] = {
+	1.08000004f,
+	1.14999998f,
+	0.899999976f,
+	-0.159999996f,
+	0.00428749993f,
+	0.00300000003f,
+	0.699999988f,
 };
 
 static constexpr LqiCoaxialCollectiveModel kModel {
@@ -173,7 +183,7 @@ static constexpr LqiCoaxialCollectiveModel kModel {
 	LqiCoaxialCollectiveModel::WorldFrame::NED,
 	LqiCoaxialCollectiveModel::BodyFrame::FRD,
 	LqiCoaxialCollectiveModel::QuaternionConvention::HamiltonWxyzBodyToWorld,
-	LqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationDualMotorCommonDifferentialServoRollPitch,
+	LqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationSharedYawAntiWindup,
 	kAttitudeGain,
 	kServoDirection,
 	kMaximumMoment,
@@ -205,12 +215,15 @@ static constexpr LqiCoaxialCollectiveModel kModel {
 	1e-10f,
 	0.02f,
 	0.002f,
-	0.3490659f,
-	0.3490659f,
-	1.2f,
+	0.174532925f,
+	0.174532925f,
+	0.3f,
 	kManualCommandDecay,
-	504u,
-	0x78ae1111u,
+	540u,
+	0x30298dafu,
+	kYawBalance,
+	0.5f,
+	0.5f,
 };
 
 } // namespace lqi_coaxial_collective

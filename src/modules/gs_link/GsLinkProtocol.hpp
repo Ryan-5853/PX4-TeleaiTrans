@@ -36,6 +36,8 @@ enum class PacketClass : uint8_t {
 enum class DataId : uint8_t {
 	Rc = 0x01,
 	Telemetry = 0x02,
+	MocapAttitude = 0x03,
+	TimeSync = 0x04,
 };
 
 enum class CommandId : uint8_t {
@@ -57,6 +59,7 @@ enum Flags : uint8_t {
 enum RcFlags : uint8_t {
 	RcValid = 1u << 0,
 	GsReady = 1u << 1,
+	PairControl = 1u << 2, // Explicit master-only composite reference request.
 };
 
 enum StatusFlags : uint16_t {
@@ -121,6 +124,24 @@ struct __attribute__((packed)) RcPayload {
 	uint8_t link_quality{255};
 	uint16_t reserved{0};
 };
+
+// Local FLU ground pose converted to local FRD: q_frd = [w,x,-y,-z].
+// Variance is isotropic rotation-vector variance (rad^2), in the local frame.
+struct __attribute__((packed)) MocapAttitudePayload {
+	uint32_t session_id;
+	uint32_t sample_sequence;
+	uint64_t sample_time_us; // source sampling time mapped into FC hrt clock
+	float q[4]; // body FRD -> world-fixed local FRD, wxyz
+	float variance; // isotropic, avoids mixing Euler and rotation-vector covariances
+};
+static_assert(sizeof(MocapAttitudePayload) == 36, "GS-Link mocap payload size mismatch");
+
+struct __attribute__((packed)) TimeSyncResponse {
+	uint64_t ground_send_ns;
+	uint64_t fc_receive_us;
+	uint64_t fc_transmit_us;
+};
+static_assert(sizeof(TimeSyncResponse) == 24, "GS-Link time sync response size mismatch");
 
 struct __attribute__((packed)) TelemetryPayload {
 	uint32_t timestamp_ms{0};

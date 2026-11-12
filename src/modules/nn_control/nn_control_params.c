@@ -153,19 +153,20 @@ PARAM_DEFINE_FLOAT(NN_GS_SW_TH, 0.70f);
  *
  * One-based RC flight-mode slot used to request ground-station control. The
  * physical switch channel is configured with RC_MAP_FLTMODE and its slot
- * parameters are COM_FLTMODE1..6. External mode 2 maps to parameter value 101.
+ * parameters are COM_FLTMODE1..6. Slot 4 uses External Mode 2 (101);
+ * slot 6 is reserved for Composite / External Mode 3 (102).
  *
  * @min 1
  * @max 6
  * @group Direct Actuator Controller
  */
-PARAM_DEFINE_INT32(NN_GS_MODE_SLOT, 6);
+PARAM_DEFINE_INT32(NN_GS_MODE_SLOT, 4);
 
 /**
  * Ground-station command timeout
  *
  * Maximum age of a GS-Link DATA_RC sample. When exceeded, control returns to
- * RC immediately and mode 6 must be deselected and selected again.
+ * RC immediately and the ground-station slot must be reselected.
  *
  * @min 50
  * @max 1000

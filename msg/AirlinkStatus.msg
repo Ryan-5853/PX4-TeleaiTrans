@@ -1,5 +1,6 @@
 uint64 timestamp
 uint64 timestamp_sample
+uint64 operator_disarm_timestamp # explicit physical RC disarm, acknowledged while disarmed
 
 uint32 session_id
 uint32 peer_session_id

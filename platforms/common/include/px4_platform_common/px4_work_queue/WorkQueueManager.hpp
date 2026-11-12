@@ -97,6 +97,10 @@ static constexpr wq_config_t ttyUnknown{"wq:ttyUnknown", 1728, -32};
 
 static constexpr wq_config_t lp_default{"wq:lp_default", 3500, -50};
 
+// Resource-health publication must not wait behind parameter/SD persistence
+// on lp_default. Keep its priority low, but give it an independent worker.
+static constexpr wq_config_t load_mon{"wq:load_mon", 3500, -50};
+
 static constexpr wq_config_t test1{"wq:test1", 2000, 0};
 static constexpr wq_config_t test2{"wq:test2", 2000, 0};
 

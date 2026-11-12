@@ -8,6 +8,7 @@
 
 #include "CompositeMath.hpp"
 #include "../airlink/AirlinkImu.hpp"
+#include "../airlink/PairEstimateSafety.hpp"
 
 #include <modules/ekf2/EKF/ekf.h>
 
@@ -58,6 +59,7 @@ private:
 		Initializing = composite_estimator_status_s::STATE_INITIALIZING,
 		Ready = composite_estimator_status_s::STATE_READY,
 		Degraded = composite_estimator_status_s::STATE_DEGRADED,
+		Fault = composite_estimator_status_s::STATE_FAULT,
 	};
 
 	struct TimedImu {
@@ -90,6 +92,8 @@ private:
 	void Run() override;
 	void updateParameters(bool force = false);
 	void applyEkfParameters();
+	bool protectedPair() const;
+	void faultEstimate(uint64_t now_us, uint16_t reason);
 	void resetEstimator(uint64_t now_us, const char *reason);
 	bool updateLocalSource(uint64_t now_us);
 	bool initializeAttitudeFromLocalSources(uint64_t sample_time_us);
@@ -131,6 +135,10 @@ private:
 	uint64_t _last_common_us{0}, _last_status_pub_us{0}, _last_yaw_pub_us{0};
 	uint32_t _peer_session{0}, _frame_count{0}, _yaw_reference_count{0}, _selected_imu_instance{0};
 	uint8_t _reset_counter{0};
+	bool _estimate_fault_latched{false};
+	uint16_t _fault_reason{composite_estimator_status_s::FAULT_NONE};
+	uint32_t _fault_epoch{0};
+	uint64_t _acknowledged_disarm{0};
 	px4::atomic<uint32_t> _commands{0};
 	AppliedParameters _applied{};
 

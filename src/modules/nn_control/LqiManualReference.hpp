@@ -22,6 +22,17 @@
  * reference constants of the model, so the same implementation serves both
  * the 13-state nominal and the 19-state identified descriptors.
  */
+namespace lqi_manual_reference_detail
+{
+template <typename Model>
+inline bool followMeasuredHeading(const Model &) { return false; }
+
+inline bool followMeasuredHeading(const LqiCoaxialCollectiveModel &model)
+{
+	return model.collective_contract == LqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationSharedYawAntiWindup;
+}
+}
+
 template <typename Model>
 class LqiManualReferenceT
 {
@@ -64,9 +75,9 @@ public:
 		output.target_angular_velocity_b[2] = _filtered_stick[2] * _model.max_yaw_rate_rad_s;
 		output.collective_base = (clampUnit(rc_throttle) + 1.0f) * 0.5f;
 
-		// Initialize target yaw from measured heading, then integrate the filtered
-		// yaw-rate command exactly like VirtualPilotCommandSource. Yaw angle itself
-		// is removed from the LQI state after forming the relative quaternion.
+		// Legacy descriptors integrate the filtered yaw-rate command. Contract 4
+		// follows measured heading for the roll/pitch reference instead: yaw is
+		// controlled by rate, and an unreachable heading must not rotate RP axes.
 		const float w = current_q_wb[0];
 		const float x = current_q_wb[1];
 		const float y = current_q_wb[2];
@@ -79,7 +90,13 @@ public:
 			_initialized = true;
 		}
 
-		_target_yaw += output.target_angular_velocity_b[2] * _model.dt_s;
+		if (lqi_manual_reference_detail::followMeasuredHeading(_model)) {
+			// Rate-mode yaw must not drag roll/pitch reference axes along an
+			// unreachable integrated heading when yaw authority is exhausted.
+			_target_yaw = heading;
+		} else {
+			_target_yaw += output.target_angular_velocity_b[2] * _model.dt_s;
+		}
 		constexpr float kPi{3.14159265358979323846f};
 
 		if (_target_yaw > kPi) {

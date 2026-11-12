@@ -8,8 +8,15 @@
 
 #include "ControllerBackend.hpp"
 #include "GroundStationGate.hpp"
+#include "PairGsGate.hpp"
 #include "NNVerificationProtocol.hpp"
 #include "AirlinkLandingGuard.hpp"
+#include "AttitudeTerminationGuard.hpp"
+#include "LqiManualReference.hpp"
+#include "LqiCoaxialCollectivePayload.hpp"
+#include <uORB/topics/composite_attitude_estimate.h>
+#include "../airlink/PairEstimateSafety.hpp"
+#include <uORB/topics/composite_control_reference.h>
 
 #include <drivers/drv_hrt.h>
 #include <lib/perf/perf_counter.h>
@@ -85,6 +92,7 @@ private:
 		AirframeMismatch,
 		AirlinkCommandStale,
 		SingleLanding,
+		AttitudeTermination,
 	};
 
 	void Run() override;
@@ -94,6 +102,22 @@ private:
 	void publishExternalModeControlMode(hrt_abstime now);
 	void publishArmingCheckReply(const arming_check_request_s &request);
 	void updateManualSource(hrt_abstime now);
+	void updatePairMode(hrt_abstime now);
+	uORB::Subscription _pair_state_sub{ORB_ID(composite_attitude_estimate)};
+	uORB::Publication<composite_control_reference_s> _pair_reference_pub{ORB_ID(composite_control_reference)};
+	composite_attitude_estimate_s _pair_state{};
+	LqiCoaxialManualReference _pair_reference{lqi_coaxial_collective::kModel};
+	AttitudeTerminationGuard _attitude_termination_guard{};
+	uint64_t _pair_registration_request{0};
+	int8_t _pair_mode_id{-1};
+	int8_t _pair_arming_check_id{-1};
+	PairGsGate _pair_gs_gate{};
+	bool _pair_gs_active{false};
+	bool _pair_fault_latched{false};
+	pair_estimate_safety::Guard _pair_estimate_guard{};
+	bool _pair_link_seen{false};
+	uint64_t _pair_operator_disarm_timestamp{0};
+	bool _pair_mode_was_selected{false};
 	void handleFlightPhaseTransitions();
 	bool buildInput(ControllerInput &input, hrt_abstime now, bool synthetic_landing = false);
 	bool rcManualControlValid(hrt_abstime now);
@@ -101,7 +125,7 @@ private:
 	bool gsLinkControlValid(hrt_abstime now);
 	void publishGsLinkStatus(hrt_abstime now);
 	bool actuatorAuthorityAllowed(bool landing_fallback = false);
-	bool validateOutput(const ActuatorSetpoint &output);
+	bool validateOutput(ActuatorSetpoint &output);
 	void publishOutput(const ActuatorSetpoint *output, hrt_abstime now);
 	bool airlinkControlsOutput(hrt_abstime now) const;
 	bool buildAirlinkOutput(ActuatorSetpoint &output, hrt_abstime now);

@@ -51,7 +51,7 @@ namespace load_mon
 
 LoadMon::LoadMon() :
 	ModuleParams(nullptr),
-	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::lp_default)
+	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::load_mon)
 {
 }
 
@@ -59,6 +59,9 @@ LoadMon::~LoadMon()
 {
 	ScheduleClear();
 	perf_free(_cycle_perf);
+	perf_free(_run_interval_perf);
+	perf_free(_publish_interval_perf);
+	perf_free(_idle_unchanged_perf);
 }
 
 int LoadMon::task_spawn(int argc, char *argv[])
@@ -86,6 +89,7 @@ void LoadMon::start()
 
 void LoadMon::Run()
 {
+	perf_count(_run_interval_perf);
 #if defined (__PX4_LINUX)
 
 	if (_proc_fd == nullptr) {	// init fd
@@ -154,6 +158,7 @@ void LoadMon::cpuload()
 	leave_critical_section(irqstate);
 
 	if ((now == _last_idle_time_sample) || (total_runtime == _last_idle_time)) {
+		perf_count(_idle_unchanged_perf);
 		return;
 	}
 
@@ -236,6 +241,7 @@ void LoadMon::cpuload()
 	cpuload.timestamp = hrt_absolute_time();
 
 	_cpuload_pub.publish(cpuload);
+	perf_count(_publish_interval_perf);
 
 	// store for next iteration
 #if defined(__PX4_LINUX)
@@ -302,6 +308,16 @@ void LoadMon::stack_usage()
 	_stack_task_index = (_stack_task_index + 1) % CONFIG_FS_PROCFS_MAX_TASKS;
 }
 #endif
+
+int LoadMon::print_status()
+{
+	PX4_INFO("running on dedicated wq:load_mon (2 Hz)");
+	perf_print_counter(_cycle_perf);
+	perf_print_counter(_run_interval_perf);
+	perf_print_counter(_publish_interval_perf);
+	perf_print_counter(_idle_unchanged_perf);
+	return 0;
+}
 
 int LoadMon::print_usage(const char *reason)
 {

@@ -64,7 +64,12 @@ void Ekf::controlExternalVisionFusion(const imuSample &imu_sample)
 
 		updateEvAttitudeErrorFilter(ev_sample, ev_reset);
 
-		controlEvYawFusion(imu_sample, ev_sample, starting_conditions_passing, ev_reset, quality_sufficient, _aid_src_ev_yaw);
+		if (_params.ev_ctrl & static_cast<int32_t>(EvCtrl::ATTITUDE)) {
+			controlEvAttitudeFusion(ev_sample, starting_conditions_passing, ev_reset, quality_sufficient);
+		} else {
+			if (_ev_att_active) { stopEvYawFusion(); _ev_att_active = false; }
+			controlEvYawFusion(imu_sample, ev_sample, starting_conditions_passing, ev_reset, quality_sufficient, _aid_src_ev_yaw);
+		}
 
 		switch (ev_sample.vel_frame) {
 		case VelocityFrame::BODY_FRAME_FRD: {
@@ -86,7 +91,7 @@ void Ekf::controlExternalVisionFusion(const imuSample &imu_sample)
 			}
 
 		default:
-			return;
+			break;
 		}
 
 		controlEvPosFusion(imu_sample, ev_sample, starting_conditions_passing, ev_reset, quality_sufficient, _aid_src_ev_pos);
@@ -105,6 +110,8 @@ void Ekf::controlExternalVisionFusion(const imuSample &imu_sample)
 		stopEvPosFusion();
 		stopEvVelFusion();
 		stopEvYawFusion();
+		_ev_att_active = false;
+		_aid_src_ev_att.fused = false;
 		stopEvHgtFusion();
 
 		_ev_q_error_initialized = false;
@@ -128,4 +135,112 @@ void Ekf::updateEvAttitudeErrorFilter(extVisionSample &ev_sample, bool ev_reset)
 	} else {
 		_ev_q_error_filt.update(q_error);
 	}
+}
+
+namespace
+{
+// PX4 attitude errors are left-multiplicative, expressed in the local frame.
+Vector3f evRotationResidual(const Quatf &predicted, const Quatf &observed)
+{
+	Quatf error = (predicted * observed.inversed()).normalized();
+
+	if (error(0) < 0.f) { error = -error; }
+
+	return matrix::AxisAnglef(error);
+}
+
+matrix::SquareMatrix3f evRotationJacobian(const Quatf &predicted, const Quatf &observed)
+{
+	// Central differences of the SO(3) log avoid Euler singularities. Only the
+	// three attitude-error states are nonzero; use the same left perturbation as fuse().
+	matrix::SquareMatrix3f H;
+	constexpr float epsilon = 1e-3f;
+
+	for (int axis = 0; axis < 3; ++axis) {
+		Vector3f delta{};
+		delta(axis) = epsilon;
+		const Vector3f plus = evRotationResidual(Quatf(matrix::AxisAnglef(delta)) * predicted, observed);
+		const Vector3f minus = evRotationResidual(Quatf(matrix::AxisAnglef(-delta)) * predicted, observed);
+		H.col(axis) = (plus - minus) / (2.f * epsilon);
+	}
+
+	return H;
+}
+}
+
+void Ekf::controlEvAttitudeFusion(const extVisionSample &sample, bool starting, bool reset, bool quality)
+{
+	auto &aid = _aid_src_ev_att;
+	aid.fused = false;
+	const bool frame_valid = sample.pos_frame == PositionFrame::LOCAL_FRAME_NED
+				 || sample.pos_frame == PositionFrame::LOCAL_FRAME_FRD;
+	const bool frame_conflict = sample.pos_frame != PositionFrame::LOCAL_FRAME_NED
+				    && (_control_status.flags.gnss_pos || _control_status.flags.gnss_vel);
+
+	if (!quality || !frame_valid || frame_conflict || !_control_status.flags.tilt_align
+	    || !sample.quat.isAllFinite() || !sample.orientation_var.isAllFinite() || !starting
+	    || (reset && _control_status.flags.in_air)) {
+		if (_ev_att_active) { stopEvYawFusion(); }
+		_ev_att_active = false;
+		aid.innovation_rejected = true;
+		return;
+	}
+
+	const float variance = math::max(sample.orientation_var.max(), sq(_params.ev_att_noise), sq(0.01f));
+
+	if (!_ev_att_active) {
+		// Switch off yaw-only fusion before taking ownership of its heading-aiding flag.
+		stopEvYawFusion();
+
+		if (!_control_status.flags.in_air && sample.pos_frame == PositionFrame::LOCAL_FRAME_FRD) {
+			resetQuatStateYaw(getEulerYaw(sample.quat), variance);
+			_control_status.flags.yaw_align = false; // arbitrary heading, not geographic north
+		}
+	}
+
+	const Vector3f innovation = evRotationResidual(_state.quat_nominal, sample.quat);
+	const auto H_att = evRotationJacobian(_state.quat_nominal, sample.quat);
+	Vector3f innovation_variance;
+
+	for (int axis = 0; axis < 3; ++axis) {
+		VectorState H{};
+		for (int j = 0; j < 3; ++j) { H(State::quat_nominal.idx + j) = H_att(axis, j); }
+		innovation_variance(axis) = H.dot(P * H) + variance;
+	}
+
+	updateAidSourceStatus(aid, sample.time_us, Vector3f(matrix::AxisAnglef(sample.quat)),
+			      Vector3f(variance, variance, variance), innovation, innovation_variance,
+			      math::max(_params.heading_innov_gate, 1.f));
+
+	// Never follow a rigid-body flip/rebinding or a large in-flight attitude jump.
+	if (innovation.norm() > math::radians(30.f) || aid.innovation_rejected) {
+		aid.innovation_rejected = true;
+
+		if (_ev_att_active && isTimedOut(aid.time_last_fuse, EV_MAX_INTERVAL)) {
+			stopEvYawFusion();
+			_ev_att_active = false;
+		}
+
+		return;
+	}
+
+	for (int axis = 0; axis < 3; ++axis) {
+		// Relinearize at the state corrected by preceding scalar updates.
+		const auto H_current = evRotationJacobian(_state.quat_nominal, sample.quat);
+		const Vector3f residual = evRotationResidual(_state.quat_nominal, sample.quat);
+		VectorState H{};
+		for (int j = 0; j < 3; ++j) { H(State::quat_nominal.idx + j) = H_current(axis, j); }
+		const VectorState PH = P * H;
+		const float S = H.dot(PH) + variance;
+		VectorState K = PH / S;
+		measurementUpdate(K, H, variance, residual(axis));
+	}
+
+	aid.fused = true;
+	aid.time_last_fuse = _time_delayed_us;
+	_ev_att_active = true;
+	// Reuse the existing external-heading flag to inhibit competing magnetic yaw fusion.
+	_control_status.flags.ev_yaw = true;
+
+	if (sample.pos_frame == PositionFrame::LOCAL_FRAME_NED) { _control_status.flags.yaw_align = true; }
 }

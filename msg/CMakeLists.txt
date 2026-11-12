@@ -50,6 +50,7 @@ set(msg_files
 	AirlinkActuatorCommand.msg
 	AirlinkPairCommand.msg
 	AirlinkSensorState.msg
+	AirlinkHealth.msg
 	AirlinkStatus.msg
 	AirlinkTestResult.msg
 	AirlinkYawReference.msg
@@ -61,6 +62,8 @@ set(msg_files
 	CanInterfaceStatus.msg
 	CellularStatus.msg
 	CollisionConstraints.msg
+	CompositeControlStatus.msg
+	CompositeControlReference.msg
 	CompositeAttitudeEstimate.msg
 	CompositeEstimatorStatus.msg
 	CompositeYawReference.msg

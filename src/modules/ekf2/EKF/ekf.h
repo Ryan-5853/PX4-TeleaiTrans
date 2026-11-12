@@ -370,6 +370,7 @@ public:
 	const auto &aid_src_ev_pos() const { return _aid_src_ev_pos; }
 	const auto &aid_src_ev_vel() const { return _aid_src_ev_vel; }
 	const auto &aid_src_ev_yaw() const { return _aid_src_ev_yaw; }
+	const auto &aid_src_ev_att() const { return _aid_src_ev_att; }
 
 	const BiasEstimator::status &getEvHgtBiasEstimatorStatus() const { return _ev_hgt_b_est.getStatus(); }
 	const BiasEstimator::status &getEvPosBiasEstimatorStatus(int i) const { return _ev_pos_b_est.getStatus(i); }
@@ -576,6 +577,8 @@ private:
 	estimator_aid_source2d_s _aid_src_ev_pos{};
 	estimator_aid_source3d_s _aid_src_ev_vel{};
 	estimator_aid_source1d_s _aid_src_ev_yaw{};
+	estimator_aid_source3d_s _aid_src_ev_att{};
+	bool _ev_att_active{false};
 
 	uint8_t _nb_ev_pos_reset_available{0};
 	uint8_t _nb_ev_vel_reset_available{0};
@@ -866,6 +869,7 @@ private:
 				estimator_aid_source2d_s &aid_src);
 	void controlEvVelFusion(ExternalVisionVel &ev, const bool common_starting_conditions_passing, const bool ev_reset,
 				const bool quality_sufficient, estimator_aid_source3d_s &aid_src);
+	void controlEvAttitudeFusion(const extVisionSample &sample, bool starting, bool reset, bool quality);
 	void controlEvYawFusion(const imuSample &imu_sample, const extVisionSample &ev_sample,
 				const bool common_starting_conditions_passing, const bool ev_reset, const bool quality_sufficient,
 				estimator_aid_source1d_s &aid_src);

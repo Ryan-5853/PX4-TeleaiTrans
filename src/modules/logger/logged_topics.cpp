@@ -130,9 +130,9 @@ void LoggedTopics::add_default_topics()
 	add_optional_topic("tiltrotor_extra_controls", 100);
 	add_topic("trajectory_setpoint", 200);
 	add_topic("transponder_report");
-	add_topic("vehicle_acceleration", 50);
+	add_topic("vehicle_acceleration", 2);
 	add_topic("vehicle_air_data", 200);
-	add_topic("vehicle_angular_velocity", 20);
+	add_topic("vehicle_angular_velocity", 2);
 	add_topic("vehicle_attitude", 50);
 	add_topic("vehicle_attitude_setpoint", 50);
 	add_topic("vehicle_command");
@@ -152,11 +152,19 @@ void LoggedTopics::add_default_topics()
 	add_topic("wind", 1000);
 
 	// Composite attitude estimator and the exact AIRLINK samples it consumes.
-	add_topic("airlink_status", 500);
-	add_topic("airlink_sensor_state", 500);
+	add_topic("airlink_status", 20);
+	add_topic("airlink_health", 2);
+	add_topic("airlink_sensor_state", 2);
 	add_topic("airlink_yaw_reference", 1000);
-	add_topic("composite_attitude_estimate", 500);
-	add_topic("composite_estimator_status", 100);
+	add_topic("composite_attitude_estimate", 2);
+	add_topic("composite_control_reference");
+	add_topic("composite_control_status");
+	add_topic("airlink_pair_command", 2);
+	add_topic("airlink_actuator_command", 2);
+	add_topic("gs_link_control", 20);
+	add_topic("gs_link_status", 20);
+	add_topic("logger_status", 1000);
+	add_topic("composite_estimator_status", 20);
 	add_topic("composite_yaw_reference", 1000);
 
 	// multi topics
@@ -189,6 +197,8 @@ void LoggedTopics::add_default_topics()
 	add_optional_topic_multi("estimator_sensor_bias", 1000);
 	add_optional_topic_multi("estimator_status", 200);
 	add_optional_topic_multi("estimator_status_flags", 10);
+	add_optional_topic_multi("estimator_aid_src_ev_att", 20);
+	add_optional_topic("vehicle_visual_odometry", 20);
 	add_optional_topic_multi("yaw_estimator_status", 1000);
 
 	// log all raw sensors at minimal rate (at least 1 Hz)
@@ -212,8 +222,8 @@ void LoggedTopics::add_default_topics()
 	add_optional_topic("pps_capture");
 
 	// additional control allocation logging
-	add_topic("actuator_motors", 100);
-	add_topic("actuator_servos", 100);
+	add_topic("actuator_motors", 2);
+	add_topic("actuator_servos", 2);
 	add_topic_multi("vehicle_thrust_setpoint", 20, 2);
 	add_topic_multi("vehicle_torque_setpoint", 20, 2);
 
@@ -530,12 +540,29 @@ bool LoggedTopics::initialize_logged_topics(SDLogProfileMask profile)
 	add_topic("vehicle_angular_velocity",  5, 0);
 	add_topic("actuator_motors",           5, 0);
 	add_topic("actuator_servos",           5, 0);
-	add_topic("esc_status",               20, 0);
+	add_topic("esc_status",               50, 0);
 
 	// Estimator diagnostics at 100 Hz or lower. Raw dual accelerometers remain
 	// available for consistency checks without duplicating all native samples.
 	add_topic("vehicle_acceleration",     10);
 	add_topic_multi("sensor_accel",       20, 2);
+
+	// Routine attitude diagnostics: retain both gyro streams at 100 Hz.
+	// Native FIFO batches dominated SD bandwidth and caused multi-topic gaps;
+	// vibration/aliasing investigations require a separate dedicated capture.
+	add_topic_multi("sensor_gyro",         10, 2);
+	add_topic_multi("vehicle_imu_status",  100, 2);
+	add_topic("sensor_selection",         100);
+
+	// This fixed profile bypasses add_default_topics(). Subscribe here, and
+	// non-optionally, so EV publishers appearing after logger startup are found.
+	// Interval 0 preserves every observation/update at the 50 Hz source rate.
+	add_topic("vehicle_visual_odometry",     0);
+	add_topic_multi("estimator_aid_src_ev_att", 0, 2);
+	add_topic_multi("estimator_status_flags", 20, 2);
+	add_topic("gs_link_control",             20);
+	add_topic("gs_link_status",             100);
+	add_topic("logger_status",             1000);
 
 	// Control/estimator context. These topics may not be published by every
 	// controller mode; optional subscriptions simply remain inactive.
@@ -547,13 +574,16 @@ bool LoggedTopics::initialize_logged_topics(SDLogProfileMask profile)
 	// thrust-command drift during a flight.
 	add_topic("manual_control_setpoint",     20);
 	add_topic_multi("battery_status",       200, 2);
-	add_optional_topic_multi("estimator_status", 200, 2);
-	add_optional_topic_multi("estimator_sensor_bias", 200, 2);
+	add_topic_multi("estimator_status",      50, 2);
+	add_topic_multi("estimator_sensor_bias", 100, 2);
 	add_topic("sensors_status_imu",         200);
+	// Preserve the resource monitor timeline across arm/disarm. Commander
+	// treats a cpuload sample older than 2 seconds as missing health data.
+	add_topic("cpuload",                    500);
 	add_topic("system_power",             200);
 	add_topic("vehicle_control_mode",     100);
 
-	PX4_INFO("parameter identification topics: 500 Hz core + diagnostic set");
+	PX4_INFO("200 Hz attitude/control, 100 Hz dual gyro, full mocap/EKF diagnostics; no FIFO");
 
 	return _subscriptions.count > 0;
 }

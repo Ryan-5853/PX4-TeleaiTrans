@@ -51,6 +51,57 @@ inline float inverse_lookup(
 	       / (speed_1 - speed_0);
 }
 
+inline float speed_lookup(float command, const float *table, int point_count)
+{
+	int upper = 1;
+
+	while (upper < point_count - 1 && command > table[2 * upper]) { ++upper; }
+
+	const int lower = upper - 1;
+	const float width = table[2 * upper] - table[2 * lower];
+	const float fraction = width > 0.0f ? clamp((command - table[2 * lower]) / width, 0.0f, 1.0f) : 0.0f;
+	return table[2 * lower + 1] + fraction * (table[2 * upper + 1] - table[2 * lower + 1]);
+}
+
+inline bool feasible_motors(const LqiCoaxialCollectiveModel &model, float upper, float lower)
+{
+	using M = LqiCoaxialCollectiveModel;
+	const float *policy = model.yaw_balance;
+	const float cap = policy[M::MotorCommandMaximum];
+
+	if (upper < 0.0f || lower < 0.0f || upper > cap || lower > cap) { return false; }
+
+	const float wu = speed_lookup(upper, model.upper_command_to_rad_s, model.upper_motor_table_points);
+	const float wl = speed_lookup(lower, model.lower_command_to_rad_s, model.lower_motor_table_points);
+	const float ratio = policy[M::MaximumSpeedRatio];
+	return wu <= ratio * wl + 1e-3f && wl <= ratio * wu + 1e-3f;
+}
+
+inline float allocate_bounded_motors(const LqiCoaxialCollectiveModel &model,
+	float upper_base, float lower_base, float upper_delta, float lower_delta,
+	float &upper, float &lower)
+{
+	float fraction = 1.0f;
+
+	if (!feasible_motors(model, upper_base + upper_delta, lower_base + lower_delta)) {
+		float low = 0.0f;
+		float high = 1.0f;
+
+		for (int iteration = 0; iteration < 16; ++iteration) {
+			const float middle = 0.5f * (low + high);
+
+			if (feasible_motors(model, upper_base + middle * upper_delta, lower_base + middle * lower_delta)) { low = middle; }
+			else { high = middle; }
+		}
+
+		fraction = low;
+	}
+
+	upper = upper_base + fraction * upper_delta;
+	lower = lower_base + fraction * lower_delta;
+	return fraction;
+}
+
 inline void interpolate_vector(
 	const float *points,
 	const float *values,
@@ -90,7 +141,7 @@ inline void interpolate_vector(
  *
  * Both motor outputs are active. The pilot collective requests a vertical
  * acceleration and the program computes motor common/differential corrections.
- * Servos are used only for roll/pitch moments.
+ * The optional yaw-balance envelope adds a roll/pitch-priority grid common trim.
  */
 class LqiCoaxialCollectiveCore
 {
@@ -149,8 +200,12 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 	    || model.body_frame != LqiCoaxialCollectiveModel::BodyFrame::FRD
 	    || model.quaternion_convention
 	       != LqiCoaxialCollectiveModel::QuaternionConvention::HamiltonWxyzBodyToWorld
-	    || model.collective_contract
-	       != LqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationDualMotorCommonDifferentialServoRollPitch
+	    || (model.collective_contract
+		!= LqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationDualMotorCommonDifferentialServoRollPitch
+		&& model.collective_contract
+		!= LqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationBoundedRotorDifferentialGridYawTrim
+		&& model.collective_contract
+		!= LqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationSharedYawAntiWindup)
 	    || model.attitude_gain == nullptr || model.servo_direction == nullptr
 	    || model.maximum_moment_n_m == nullptr
 	    || model.motor_effectiveness_points == nullptr
@@ -163,6 +218,35 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 	    || model.manual_command_decay == nullptr
 	    || !(model.dt_s > 0.0f) || !(model.mass_kg > 0.0f)
 	    || !(model.gravity_m_s2 > 0.0f) || !(model.maximum_thrust_n > 0.0f)) {
+		return false;
+	}
+
+	using M = LqiCoaxialCollectiveModel;
+	const float *policy = model.yaw_balance;
+
+	const bool shared_yaw = model.collective_contract == M::CollectiveContract::PilotAccelerationSharedYawAntiWindup;
+
+	if ((policy != nullptr) != (shared_yaw || model.collective_contract == M::CollectiveContract::PilotAccelerationBoundedRotorDifferentialGridYawTrim)) {
+		return false;
+	}
+
+	if (policy != nullptr) {
+		for (int i = 0; i < M::YawBalanceSize; ++i) {
+			if (!std::isfinite(policy[i])) { return false; }
+		}
+
+		if (policy[M::TrimSpeedRatio] < 1.0f
+		    || policy[M::MaximumSpeedRatio] < policy[M::TrimSpeedRatio]
+		    || policy[M::MotorCommandMaximum] <= 0.0f || policy[M::MotorCommandMaximum] > 1.0f
+		    || fabsf(policy[M::GridCommonCommand]) > 1.0f
+		    || policy[M::YawIntegralMomentLimit] <= 0.0f
+		    || policy[M::LowerTorqueScale] <= 0.0f) { return false; }
+	}
+
+	if (shared_yaw && (!std::isfinite(model.roll_pitch_integral_moment_fraction)
+	    || !(model.roll_pitch_integral_moment_fraction > 0.0f) || model.roll_pitch_integral_moment_fraction > 1.0f
+	    || !std::isfinite(model.grid_common_preference_fraction)
+	    || model.grid_common_preference_fraction < 0.0f || model.grid_common_preference_fraction > 1.0f)) {
 		return false;
 	}
 
@@ -195,7 +279,10 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 	const float rate_error[3] {
 		input.angular_velocity_b[0] - input.target_angular_velocity_b[0],
 		input.angular_velocity_b[1] - input.target_angular_velocity_b[1],
-		input.angular_velocity_b[2] - input.target_angular_velocity_b[2],
+		input.angular_velocity_b[2] - (policy != nullptr
+			? lqi_coaxial_collective_detail::clamp(input.target_angular_velocity_b[2],
+				-model.max_yaw_rate_rad_s, model.max_yaw_rate_rad_s)
+			: input.target_angular_velocity_b[2]),
 	};
 
 	using lqi_coaxial_collective_detail::clamp;
@@ -278,7 +365,7 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 
 	// Balanced coaxial targets: torque coefficients define the lower/upper
 	// speed ratio, then each rotor uses its own command-domain speed table.
-	const float speed_ratio =
+	const float speed_ratio = policy != nullptr ? policy[M::TrimSpeedRatio] :
 		std::sqrt(
 			model.motor_torque_coefficients[0]
 			/ fmaxf(model.motor_torque_coefficients[1], 1e-16f));
@@ -286,8 +373,20 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 		model.thrust_coefficients[0]
 		+ model.thrust_coefficients[1] * speed_ratio * speed_ratio
 		+ model.thrust_coefficients[2] * speed_ratio;
-	const float upper_target_speed =
+	float upper_target_speed =
 		std::sqrt(fmaxf(desired_thrust, 0.0f) / fmaxf(thrust_denominator, 1e-16f));
+	bool base_saturated = false;
+
+	if (policy != nullptr) {
+		const float upper_cap = lqi_coaxial_collective_detail::speed_lookup(
+			policy[M::MotorCommandMaximum], model.upper_command_to_rad_s, model.upper_motor_table_points);
+		const float lower_cap = lqi_coaxial_collective_detail::speed_lookup(
+			policy[M::MotorCommandMaximum], model.lower_command_to_rad_s, model.lower_motor_table_points);
+		const float speed_cap = fminf(upper_cap, lower_cap / speed_ratio);
+		base_saturated = upper_target_speed > speed_cap;
+		upper_target_speed = fminf(upper_target_speed, speed_cap);
+	}
+
 	const float lower_target_speed = speed_ratio * upper_target_speed;
 	const float upper_base = inverse_lookup(
 		upper_target_speed, model.upper_command_to_rad_s,
@@ -296,12 +395,36 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 		lower_target_speed, model.lower_command_to_rad_s,
 		model.lower_motor_table_points);
 
+	const float base_thrust = thrust_denominator * upper_target_speed * upper_target_speed;
 	const float errors[3] {roll_error, pitch_error, rate_error[2]};
 	float attitude_integral[3] {};
 
 	for (int axis = 0; axis < 3; ++axis) {
 		attitude_integral[axis] =
 			persistent[2 + axis] + errors[axis] * model.dt_s;
+	}
+
+	const float yaw_integral_gain = model.attitude_gain[23];
+
+	if (policy != nullptr) {
+		const float limit = policy[M::YawIntegralMomentLimit] / fmaxf(fabsf(yaw_integral_gain), 1e-9f);
+		attitude_integral[2] = clamp(attitude_integral[2], -limit, limit);
+	}
+
+	float previous_roll_pitch_integral[2] {persistent[2], persistent[3]};
+
+	if (shared_yaw) {
+		for (int axis = 0; axis < 2; ++axis) {
+			const float gain = model.attitude_gain[axis * M::kStateSize + 5 + axis];
+			const float limit = model.roll_pitch_integral_moment_fraction * model.maximum_moment_n_m[axis]
+				/ fmaxf(fabsf(gain), 1e-9f);
+			previous_roll_pitch_integral[axis] = clamp(persistent[2 + axis], -limit, limit);
+			// Low commanded thrust is not a landing detector. It only prevents
+			// building attitude bias while very little control force is available.
+			attitude_integral[axis] = base_thrust < 0.5f * model.mass_kg * model.gravity_m_s2
+				? previous_roll_pitch_integral[axis]
+				: clamp(previous_roll_pitch_integral[axis] + errors[axis] * model.dt_s, -limit, limit);
+		}
 	}
 
 	const float state[LqiCoaxialCollectiveModel::kStateSize] {
@@ -315,6 +438,8 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 		attitude_integral[2],
 	};
 	float desired_moment[3] {};
+	float raw_yaw_moment = 0.0f;
+	float raw_moment[3] {};
 
 	for (int row = 0; row < 3; ++row) {
 		float accumulator = 0.0f;
@@ -323,6 +448,9 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 			accumulator += model.attitude_gain[row * LqiCoaxialCollectiveModel::kStateSize + col]
 				       * state[col];
 		}
+
+		raw_moment[row] = -accumulator;
+		if (row == 2) { raw_yaw_moment = -accumulator; }
 
 		desired_moment[row] =
 			clamp(-accumulator,
@@ -360,6 +488,38 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 		servos[servo] = clamp(servo_raw[servo] * servo_vector_scale, -1.0f, 1.0f);
 	}
 
+	float grid_common = 0.0f;
+	float grid_common_min = 0.0f;
+	float grid_common_max = 0.0f;
+	float base_yaw_moment = 0.0f;
+	float grid_yaw_moment = 0.0f;
+
+	if (policy != nullptr) {
+		// Roll/pitch take priority: only insert common deflection into the
+		// remaining intersection of all three physical servo intervals.
+		float common_min = -1.0f;
+		float common_max = 1.0f;
+
+		for (float value : servos) {
+			common_min = fmaxf(common_min, -1.0f - value);
+			common_max = fminf(common_max, 1.0f - value);
+		}
+
+		const float ramp = clamp(desired_thrust / (model.mass_kg * model.gravity_m_s2), 0.0f, 1.0f);
+		const float full_common = policy[M::GridCommonCommand] * ramp;
+		grid_common_min = fmaxf(common_min, fminf(full_common, 0.0f));
+		grid_common_max = fminf(common_max, fmaxf(full_common, 0.0f));
+		grid_common = clamp(full_common * (shared_yaw ? model.grid_common_preference_fraction : 1.0f),
+			grid_common_min, grid_common_max);
+
+		for (float &value : servos) { value = clamp(value + grid_common, -1.0f, 1.0f); }
+
+		base_yaw_moment = model.motor_torque_coefficients[0] * upper_target_speed * upper_target_speed
+			- model.motor_torque_coefficients[1] * policy[M::LowerTorqueScale] * lower_target_speed * lower_target_speed;
+		grid_yaw_moment = policy[M::GridYawPerThrustPerCommand] * base_thrust * grid_common;
+	}
+
+	float motor_yaw_request = desired_moment[2] - base_yaw_moment - grid_yaw_moment;
 	float motor_effectiveness[4] {};
 	interpolate_vector(
 		model.motor_effectiveness_points,
@@ -368,6 +528,8 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 		4,
 		clamp(0.5f * (upper_base + lower_base), 0.0f, 1.0f),
 		motor_effectiveness);
+	if (policy != nullptr) { motor_effectiveness[3] *= policy[M::LowerTorqueScale]; }
+
 	const float combined_regularization =
 		2.0f * model.motor_mix_regularization;
 	const float common_thrust_slope =
@@ -388,23 +550,60 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 	}
 
 	const float common_output =
-		-differential_thrust_slope * desired_moment[2] / determinant;
+		-differential_thrust_slope * motor_yaw_request / determinant;
 	const float differential_output =
 		(common_thrust_slope + combined_regularization)
-		* desired_moment[2] / determinant;
+		* motor_yaw_request / determinant;
 	const float motor_raw[2] {
 		upper_base + common_output + differential_output,
 		lower_base + common_output - differential_output,
 	};
-	const float upper = clamp(motor_raw[0], 0.0f, 1.0f);
-	const float lower = clamp(motor_raw[1], 0.0f, 1.0f);
-	const bool motor_saturated =
+	float upper = clamp(motor_raw[0], 0.0f, 1.0f);
+	float lower = clamp(motor_raw[1], 0.0f, 1.0f);
+	bool motor_saturated =
 		motor_raw[0] < 0.0f || motor_raw[0] > 1.0f
 		|| motor_raw[1] < 0.0f || motor_raw[1] > 1.0f;
 
+	bool yaw_limited = fabsf(raw_yaw_moment - desired_moment[2]) > 1e-7f;
+
+	if (policy != nullptr) {
+		// Scale the common/differential correction as a vector. This preserves
+		// its local zero-thrust direction; independent endpoint clipping does not.
+		const float upper_per_moment = (-differential_thrust_slope + common_thrust_slope + combined_regularization) / determinant;
+		const float lower_per_moment = (-differential_thrust_slope - common_thrust_slope - combined_regularization) / determinant;
+		float fraction = lqi_coaxial_collective_detail::allocate_bounded_motors(model,
+			upper_base, lower_base, motor_raw[0] - upper_base, motor_raw[1] - lower_base, upper, lower);
+
+		if (shared_yaw && fraction < 1.0f) {
+			const float achieved_motor_yaw = motor_effectiveness[2] * (upper - upper_base)
+				+ motor_effectiveness[3] * (lower - lower_base);
+			const float grid_slope = policy[M::GridYawPerThrustPerCommand] * base_thrust;
+
+			if (fabsf(grid_slope) > 1e-9f) {
+				// Share the residual with the grid. A negative common moves toward
+				// zero when it opposes positive yaw; negative yaw may use the rest
+				// of the original bounded trim range. Roll/pitch remain unchanged.
+				const float selected = clamp(grid_common + (motor_yaw_request - achieved_motor_yaw) / grid_slope,
+					grid_common_min, grid_common_max);
+
+				for (float &value : servos) { value = clamp(value + selected - grid_common, -1.0f, 1.0f); }
+
+				grid_common = selected;
+				grid_yaw_moment = grid_slope * grid_common;
+				motor_yaw_request = desired_moment[2] - base_yaw_moment - grid_yaw_moment;
+				fraction = lqi_coaxial_collective_detail::allocate_bounded_motors(model,
+					upper_base, lower_base, upper_per_moment * motor_yaw_request,
+					lower_per_moment * motor_yaw_request, upper, lower);
+			}
+		}
+
+		motor_saturated = base_saturated || fraction < 1.0f;
+		yaw_limited = yaw_limited || fraction < 1.0f;
+	}
+
 	next_persistent[0] = filtered_up_acceleration;
 	next_persistent[1] =
-		motor_saturated
+		(policy != nullptr ? base_saturated : motor_saturated)
 		? persistent[1]
 		: candidate_acceleration_integral;
 	const bool attitude_saturated = servo_saturated || motor_saturated;
@@ -414,6 +613,32 @@ inline bool LqiCoaxialCollectiveCore::stepFromState(
 			attitude_saturated
 			? persistent[2 + axis]
 			: attitude_integral[axis];
+	}
+
+	if (policy != nullptr) {
+		// Independent axes, bounded yaw bias, and directional anti-windup:
+		// permit the yaw integral to unwind even while the mixer is saturated.
+		for (int axis = 0; axis < 2; ++axis) {
+			if (shared_yaw) {
+				const float gain = model.attitude_gain[axis * M::kStateSize + 5 + axis];
+				const float achieved = desired_moment[axis] * servo_vector_scale;
+				const float residual = raw_moment[axis] - achieved;
+				const float change = -gain * (attitude_integral[axis] - previous_roll_pitch_integral[axis]);
+				next_persistent[2 + axis] = fabsf(residual) > 1e-7f && change * residual > 0.0f
+					? previous_roll_pitch_integral[axis] : attitude_integral[axis];
+			} else {
+				next_persistent[2 + axis] = servo_saturated ? persistent[2 + axis] : attitude_integral[axis];
+			}
+		}
+
+		const float achieved_yaw = base_yaw_moment + grid_yaw_moment
+			+ motor_effectiveness[2] * (upper - upper_base)
+			+ motor_effectiveness[3] * (lower - lower_base);
+		const float residual = raw_yaw_moment - achieved_yaw;
+		const float integral_moment_change = -yaw_integral_gain * (attitude_integral[2] - persistent[4]);
+		const float limit = policy[M::YawIntegralMomentLimit] / fmaxf(fabsf(yaw_integral_gain), 1e-9f);
+		next_persistent[4] = clamp(yaw_limited && integral_moment_change * residual > 0.0f
+			? persistent[4] : attitude_integral[2], -limit, limit);
 	}
 
 	output.upper = upper;

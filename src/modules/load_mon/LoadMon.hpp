@@ -73,6 +73,7 @@ public:
 	static int print_usage(const char *reason = nullptr);
 
 	void start();
+	int print_status() override;
 
 private:
 	/** Do a compute and schedule the next cycle. */
@@ -103,6 +104,9 @@ private:
 #endif
 
 	perf_counter_t _cycle_perf{perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")};
+	perf_counter_t _run_interval_perf{perf_alloc(PC_INTERVAL, MODULE_NAME": run interval")};
+	perf_counter_t _publish_interval_perf{perf_alloc(PC_INTERVAL, MODULE_NAME": publish interval")};
+	perf_counter_t _idle_unchanged_perf{perf_alloc(PC_COUNT, MODULE_NAME": idle counter unchanged")};
 
 	DEFINE_PARAMETERS(
 		(ParamBool<px4::params::SYS_STCK_EN>) _param_sys_stck_en

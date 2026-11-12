@@ -145,7 +145,8 @@ enum class GnssCtrl : uint8_t {
 	HPOS  = (1 << 0),
 	VPOS  = (1 << 1),
 	VEL  = (1 << 2),
-	YAW  = (1 << 3)
+	YAW  = (1 << 3),
+	ATTITUDE = (1 << 4)
 };
 
 enum class RngCtrl : uint8_t {
@@ -158,7 +159,8 @@ enum class EvCtrl : uint8_t {
 	HPOS = (1 << 0),
 	VPOS = (1 << 1),
 	VEL  = (1 << 2),
-	YAW  = (1 << 3)
+	YAW  = (1 << 3),
+	ATTITUDE = (1 << 4)
 };
 
 enum class MagCheckMask : uint8_t {

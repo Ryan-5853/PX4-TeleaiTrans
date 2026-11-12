@@ -44,6 +44,15 @@ public:
 	const char *name() const;
 	const char *mode() const;
 
+	bool coaxialCollectiveActive() const
+	{
+#if defined(CONFIG_NN_CONTROL_BACKEND_LQR)
+		return _model_index == 2;
+#else
+		return false;
+#endif
+	}
+
 	// Identified-LQI provenance. Generic backends return "not-applicable".
 	// NN_AIRFRAME_ID is checked against expectedAirframeNumber() before output.
 	const char *airframeId() const;
