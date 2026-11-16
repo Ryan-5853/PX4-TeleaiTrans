@@ -717,7 +717,7 @@ int GsLink::print_status()
 int GsLink::task_spawn(int argc, char *argv[])
 {
 	const char *device = "/dev/ttyS0";
-	uint32_t baudrate = 4000000;
+	uint32_t baudrate = 5000000;
 
 	for (int i = 1; i < argc; ++i) {
 		if (!strcmp(argv[i], "-d") && i + 1 < argc) {

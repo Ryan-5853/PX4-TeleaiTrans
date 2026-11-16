@@ -29,7 +29,7 @@ fi
 # /dev/ttyS0; MAVLink must not claim this port. USB MAVLink remains available
 # for QGC through /dev/ttyACM0.
 param set MAV_0_CONFIG 0
-param set SER_TEL1_BAUD 4000000
+param set SER_TEL1_BAUD 5000000
 # Enable the RC-supervised ground-station input by default. A saved user value
 # still takes precedence; actuator authority remains separately controlled by
 # NN_LQI_OUTPUT_EN.

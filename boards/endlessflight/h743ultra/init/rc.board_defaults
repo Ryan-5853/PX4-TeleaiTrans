@@ -18,6 +18,19 @@ then
     param set-default RC_CRSF_PRT_CFG 0
     param set-default GPS_1_CONFIG 0
 
+    # H7Ultra UART3 / TELEM2 is dedicated to Airlink.
+    set AIRLINK_PORT /dev/ttyS2
+
+    # Avoid MAVLink occupying UART3.
+    if param compare MAV_1_CONFIG 102
+    then
+        param set MAV_1_CONFIG 0
+    fi
+    if param compare MAV_2_CONFIG 102
+    then
+        param set MAV_2_CONFIG 0
+    fi
+
 
     # Bench bring-up safety: inhibit physical LQI outputs.
     param set NN_LQI_OUTPUT_EN 0
